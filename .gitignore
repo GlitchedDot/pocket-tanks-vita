@@ -1,0 +1,37 @@
+# Build output
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.elf
+*.self
+*.velf
+*.vpk
+*.vpk.out
+
+# Game assets / binaries (never commit these)
+*.apk
+*.obb
+libengine.so
+libfmod.so
+libc++_shared.so
+libsqlcipher.so
+pockettanks-data/
+
+# Vita crash dumps
+*.dmp
+*.psp2dmp
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
