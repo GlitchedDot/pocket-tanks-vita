@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "bootlog.h"
 
 #include <psp2/io/stat.h>
 #include <psp2/kernel/threadmgr.h>
@@ -18,6 +19,9 @@ void fatal_error(const char *fmt, ...) {
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     log_error("FATAL: %s", buf);
+    blog("FATAL: %s (exiting in 5s)", buf);
     sceKernelDelayThread(5 * 1000 * 1000);
+    blog("FATAL: exiting now");
+    bootlog_close();
     sceKernelExitProcess(0);
 }
