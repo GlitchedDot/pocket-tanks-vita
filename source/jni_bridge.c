@@ -3,6 +3,7 @@
 #include <falso_jni/FalsoJNI_Logger.h>
 
 #include "utils.h"
+#include "bootlog.h"
 #include "asset_mgr.h"
 #include "fake_motionevent.h"
 
@@ -70,16 +71,19 @@ static jobject jni_getSafeArea(jmethodID id, va_list args) {
 
 static jboolean jni_isBillingEnabled(jmethodID id, va_list args) {
     (void)id; (void)args;
-    // Shop kill-switch: the whole billing path is disabled.
-    return JNI_FALSE;
+    // Unlock: report billing available so pack purchase checks run,
+    // and checkPurchaseStatus reports PURCHASED for every SKU.
+    return JNI_TRUE;
 }
 
 static jint jni_checkPurchaseStatus(jmethodID id, va_list args) {
     jstring product = va_arg(args, jstring);
     (void)id;
-    const char *p = product ? jni->GetStringUTFChars(&jni, product, NULL) : "(null)";
-    log_info("checkPurchaseStatus(%s) -> UNKNOWN(0)", p);
-    return 0; // UNKNOWN
+    const char *p = product ? jni->GetStringUTFChars(&jni, product, NULL)
+                            : "(null)";
+    log_info("checkPurchaseStatus(%s) -> PURCHASED(2)", p);
+    if (product) jni->ReleaseStringUTFChars(&jni, product, p);
+    return 2; // CPActivity$b.PURCHASED
 }
 
 static jint jni_getRestoringPurchaseStatus(jmethodID id, va_list args) {
@@ -121,6 +125,8 @@ static jboolean jni_isKeyboardActive(jmethodID id, va_list args) {
 static void jni_exit(jmethodID id, va_list args) {
     (void)id; (void)args;
     log_info("exit() called by game");
+    blog("EXIT: game called System.exit() via JNI - silent exit to LiveArea");
+    bootlog_close();
     sceKernelExitProcess(0);
 }
 
@@ -162,6 +168,75 @@ static jboolean jni_playMod(jmethodID id, va_list args) {
 static jboolean jni_playWav(jmethodID id, va_list args) {
     (void)id; (void)args;
     return JNI_FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// Bug 21: ClassLoader + misc JNI stubs. The game resolves CPJNIParse (and
+// other helpers) via ClassLoader.findClass, not FindClass -- the
+// getClassLoader/findClass lookups were NOT FOUND, so every one of those
+// resolutions failed with "Class not found". Stub the whole path plus the
+// other newly-seen lookups (setMusicFlag, getInstance, getSoundManager,
+// didPurchaseStatusesChange, CPJNIDirectory.<init>).
+// ---------------------------------------------------------------------------
+
+static int dummy_classloader;
+static int dummy_parse_class;
+static int dummy_sound_manager;
+static int dummy_lib_instance;
+static int dummy_directory;
+
+static int findclass_log_count = 0;
+
+static jobject jni_getClassLoader(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    blog("JNI: Class.getClassLoader stubbed -> dummy");
+    return (jobject)&dummy_classloader;
+}
+
+static jobject jni_findClass(jmethodID id, va_list args) {
+    (void)id;
+    jstring jname = va_arg(args, jstring);
+    const char *name = jname ? jni->GetStringUTFChars(&jni, jname, NULL) : "(null)";
+    if (findclass_log_count < 6) {
+        findclass_log_count++;
+        blog("JNI: ClassLoader.findClass(\"%s\") stubbed -> dummy",
+             name ? name : "(null)");
+    }
+    if (jname && name)
+        jni->ReleaseStringUTFChars(&jni, jname, (char *)name);
+    return (jobject)&dummy_parse_class;
+}
+
+static void jni_setMusicFlag(jmethodID id, va_list args) {
+    (void)id;
+    int v = va_arg(args, int);
+    blog("JNI: CPJNISound.setMusicFlag(%d) stubbed -> no-op", v);
+}
+
+static jobject jni_getInstance(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    return (jobject)&dummy_lib_instance;
+}
+
+static jobject jni_getSoundManager(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    return (jobject)&dummy_sound_manager;
+}
+
+static jboolean jni_didPurchaseStatusesChange(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    // Unlock: fire TRUE exactly once so the game takes the
+    // "Pack purchase statuses did change, checking unlock status."
+    // path, re-queries every pack (all -> PURCHASED), then settles.
+    static int fired = 0;
+    if (!fired) { fired = 1; return JNI_TRUE; }
+    return JNI_FALSE;
+}
+
+static jobject jni_directory_init(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    blog("JNI: CPJNIDirectory.<init> stubbed -> dummy");
+    return (jobject)&dummy_directory;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +327,80 @@ static jboolean jni_composeEmail(jmethodID id, va_list args) {
 }
 
 // ---------------------------------------------------------------------------
+// CPJNIParse stubs (BlitWise Parse/push helper; all server-side on Android).
+// The game looks these up via GetStaticMethodID and calls them during
+// onCreate (setAppInfo). We return inert defaults so it proceeds.
+// Each stub logs once so the bootlog shows what the game wanted.
+// ---------------------------------------------------------------------------
+
+static int parse_stub_logged[10];
+
+static void parse_log_once(int idx, const char *name, const char *result) {
+    if (idx < 0 || idx >= 10 || parse_stub_logged[idx])
+        return;
+    parse_stub_logged[idx] = 1;
+    blog("JNI: CPJNIParse.%s stubbed -> %s", name, result);
+    log_info("CPJNIParse.%s stubbed -> %s", name, result);
+}
+
+static jboolean jni_parse_setAppInfo(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(0, "setAppInfo", "true");
+    // Java returns true for "parse"/"facebook"/"twitter"; false otherwise.
+    // True keeps the game's init flow moving.
+    return JNI_TRUE;
+}
+
+static jobject jni_parse_getInstallationID(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(1, "parse_getInstallationID", "\"\"");
+    return jni->NewStringUTF(&jni, "");
+}
+
+static jobject jni_parse_logOut(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(2, "parse_logOut", "\"\"");
+    return jni->NewStringUTF(&jni, "");
+}
+
+static void jni_parse_associateUserWithInstallation(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(3, "parse_associateUserWithInstallation", "no-op");
+}
+
+static jint jni_parse_badgeGetNumber(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(4, "badgeGetNumber", "0");
+    return 0;
+}
+
+static void jni_parse_badgeSetNumber(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(5, "badgeSetNumber", "no-op");
+}
+
+static void jni_parse_suppressPushAlerts(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(6, "suppressPushAlerts", "no-op");
+}
+
+static jobject jni_parse_loginWithSocial(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(7, "loginWithSocial", "null");
+    return NULL;
+}
+
+static void jni_parse_onActivityResult(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(8, "onActivityResult", "no-op");
+}
+
+static void jni_parse_onCreate(jmethodID id, va_list args) {
+    (void)id; (void)args;
+    parse_log_once(9, "onCreate", "no-op");
+}
+
+// ---------------------------------------------------------------------------
 // Name -> ID tables
 // ---------------------------------------------------------------------------
 
@@ -314,6 +463,25 @@ NameToMethodID nameToMethodId[] = {
     {241, "showConfirmationBox", METHOD_TYPE_INT},
     {242, "shareOnSocial", METHOD_TYPE_BOOLEAN},
     {243, "composeEmail", METHOD_TYPE_BOOLEAN},
+    // CPJNIParse (static)
+    {250, "setAppInfo", METHOD_TYPE_BOOLEAN},
+    {251, "parse_getInstallationID", METHOD_TYPE_OBJECT},
+    {252, "parse_logOut", METHOD_TYPE_OBJECT},
+    {253, "parse_associateUserWithInstallation", METHOD_TYPE_VOID},
+    {254, "badgeGetNumber", METHOD_TYPE_INT},
+    {255, "badgeSetNumber", METHOD_TYPE_VOID},
+    {256, "suppressPushAlerts", METHOD_TYPE_VOID},
+    {257, "loginWithSocial", METHOD_TYPE_OBJECT},
+    {258, "onActivityResult", METHOD_TYPE_VOID},
+    {259, "onCreate", METHOD_TYPE_VOID},
+    // Bug 21: ClassLoader path + misc newly-seen lookups
+    {260, "getClassLoader", METHOD_TYPE_OBJECT},
+    {261, "findClass", METHOD_TYPE_OBJECT},
+    {262, "setMusicFlag", METHOD_TYPE_VOID},
+    {263, "getInstance", METHOD_TYPE_OBJECT},
+    {264, "getSoundManager", METHOD_TYPE_OBJECT},
+    {265, "didPurchaseStatusesChange", METHOD_TYPE_BOOLEAN},
+    {266, "com/blitwise/engine/jni/CPJNIDirectory/<init>", METHOD_TYPE_OBJECT},
 };
 
 MethodsObject methodsObject[] = {
@@ -330,6 +498,14 @@ MethodsObject methodsObject[] = {
     {110, jni_getApplication},
     {221, jni_readdir},
     {232, jni_httpGetData},
+    {251, jni_parse_getInstallationID},
+    {252, jni_parse_logOut},
+    {257, jni_parse_loginWithSocial},
+    {260, jni_getClassLoader},
+    {261, jni_findClass},
+    {263, jni_getInstance},
+    {264, jni_getSoundManager},
+    {266, jni_directory_init},
 };
 
 MethodsBoolean methodsBoolean[] = {
@@ -340,6 +516,8 @@ MethodsBoolean methodsBoolean[] = {
     {213, jni_playWav},
     {242, jni_shareOnSocial},
     {243, jni_composeEmail},
+    {250, jni_parse_setAppInfo},
+    {265, jni_didPurchaseStatusesChange},
 };
 
 MethodsInt methodsInt[] = {
@@ -357,6 +535,7 @@ MethodsInt methodsInt[] = {
     {231, jni_httpInitPost},
     {233, jni_httpGetBytesDownloaded},
     {241, jni_showConfirmationBox},
+    {254, jni_parse_badgeGetNumber},
 };
 
 MethodsFloat methodsFloat[] = {
@@ -378,6 +557,12 @@ MethodsVoid methodsVoid[] = {
     {223, jni_rewinddir},
     {234, jni_httpClose},
     {240, jni_showMessageBox},
+    {253, jni_parse_associateUserWithInstallation},
+    {255, jni_parse_badgeSetNumber},
+    {256, jni_parse_suppressPushAlerts},
+    {258, jni_parse_onActivityResult},
+    {259, jni_parse_onCreate},
+    {262, jni_setMusicFlag},
 };
 
 MethodsShort methodsShort[] = {};
@@ -386,14 +571,26 @@ MethodsDouble methodsDouble[] = {};
 MethodsByte methodsByte[] = {};
 MethodsChar methodsChar[] = {};
 
-// Fields (unused by this game, but table must exist)
-NameToFieldID nameToFieldId[] = {};
+// Fields: the game reads android.graphics.Rect fields (left/top/right/bottom)
+// off the safe-area object via GetFieldID. Register them with the 960x544
+// display rect (bug 21; previously "Unknown field name" -> garbage).
+NameToFieldID nameToFieldId[] = {
+    {300, "left", FIELD_TYPE_INT},
+    {301, "top", FIELD_TYPE_INT},
+    {302, "right", FIELD_TYPE_INT},
+    {303, "bottom", FIELD_TYPE_INT},
+};
 FieldsBoolean fieldsBoolean[] = {};
 FieldsByte fieldsByte[] = {};
 FieldsChar fieldsChar[] = {};
 FieldsDouble fieldsDouble[] = {};
 FieldsFloat fieldsFloat[] = {};
-FieldsInt fieldsInt[] = {};
+FieldsInt fieldsInt[] = {
+    {300, 0},
+    {301, 0},
+    {302, 960},
+    {303, 544},
+};
 FieldsLong fieldsLong[] = {};
 FieldsObject fieldsObject[] = {};
 FieldsShort fieldsShort[] = {};
