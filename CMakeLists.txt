@@ -6,7 +6,7 @@ endif ()
 
 set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Toolchain file")
 
-project(pockettanks C)
+project(pockettanks C CXX)
 
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
@@ -14,6 +14,12 @@ set(VITA_APP_NAME "Pocket Tanks")
 set(VITA_TITLEID "PCKT00001")
 set(VITA_VPKNAME "pockettanks")
 set(VITA_VERSION "01.00")
+
+# ATTRIBUTE2=12: request the extended memory budget from the OS.
+# Without this, the 256MB newlib heap allocation in _init_vita_heap fails,
+# the first malloc returns NULL, and the process dies in _malloc_r during
+# C++ static init (vitaGL's expression::ptok constructor). Same flag as HCR.
+set(VITA_MKSFOEX_FLAGS "-d ATTRIBUTE2=12")
 
 set(DATA_PATH "ux0:data/pockettanks/" CACHE STRING "Path to data (with trailing /)")
 add_definitions(-DDATA_PATH="${DATA_PATH}")
@@ -28,7 +34,9 @@ include_directories(
 
 add_executable(${PROJECT_NAME}
   source/main.c
+  source/ptree_fake.cpp
   source/utils.c
+  source/bootlog.c
   source/egl_graphics.c
   source/jni_bridge.c
   source/fake_motionevent.c
@@ -39,6 +47,7 @@ add_executable(${PROJECT_NAME}
   source/android_log.c
   source/bionic_compat.c
   source/bionic_ctype.c
+  source/bionic_pthread.c
   source/gl_wrappers.c
   lib/falso_jni/FalsoJNI.c
   lib/falso_jni/FalsoJNI_ImplBridge.c
@@ -69,6 +78,7 @@ target_link_libraries(${PROJECT_NAME}
   SceKernelDmacMgr_stub
   ScePower_stub
   SceSysmem_stub
+  SceRtc_stub
   SceTouch_stub
   SceMotion_stub
 )

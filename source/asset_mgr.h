@@ -22,4 +22,9 @@ off_t AAsset_getLength(AAsset *asset);
 int AAsset_read(AAsset *asset, void *buf, size_t count);
 off_t AAsset_seek(AAsset *asset, off_t offset, int whence);
 
+// bionic_compat.c: asset FILE* registry for write-path tracing (bug 21).
+#include <stdio.h>
+void track_asset_file_soloader(FILE *f);
+void untrack_asset_file_soloader(FILE *f);
+
 #endif

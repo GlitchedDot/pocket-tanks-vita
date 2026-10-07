@@ -42,6 +42,18 @@ void __stack_chk_fail_soloader(void);
 int *__errno_soloader(void);
 void __assert2_soloader(const char*,int,const char*,const char*);
 int __open_2(const char*,int);
+int access_soloader(const char*,int);
+time_t time_soloader(time_t*);
+int gettimeofday_soloader(struct timeval*,void*);
+struct tm *gmtime_r_soloader(const time_t*,struct tm*);
+struct tm *localtime_r_soloader(const time_t*,struct tm*);
+struct tm *gmtime_soloader(const time_t*);
+struct tm *localtime_soloader(const time_t*);
+time_t mktime_soloader(struct tm*);
+char *asctime_soloader(const struct tm*);
+char *asctime_r_soloader(const struct tm*,char*);
+char *ctime_soloader(const time_t*);
+char *ctime_r_soloader(const time_t*,char*);
 // gl_wrappers.c
 void *pt_eglGetCurrentSurface(int readdraw);
 void glBindFramebufferOES(unsigned int, unsigned int);
@@ -62,17 +74,70 @@ int __vsnprintf_chk(char*,size_t,int,size_t,const char*,va_list);
 int __vsprintf_chk(char*,int,size_t,const char*,va_list);
 size_t __read_chk(int,void*,size_t,size_t);
 int pthread_create_soloader(pthread_t*,const void*,void*(*)(void*),void*);
+// bionic_pthread.c — Bionic-ABI pthread impls (see file header for why)
+int bionic_pthread_mutex_init(void*,const void*);
+int bionic_pthread_mutex_destroy(void*);
+int bionic_pthread_mutex_lock(void*);
+int bionic_pthread_mutex_trylock(void*);
+int bionic_pthread_mutex_unlock(void*);
+int bionic_pthread_mutexattr_init(void*);
+int bionic_pthread_mutexattr_destroy(void*);
+int bionic_pthread_mutexattr_settype(void*,int);
+int bionic_pthread_cond_init(void*,const void*);
+int bionic_pthread_cond_destroy(void*);
+int bionic_pthread_cond_wait(void*,void*);
+int bionic_pthread_cond_timedwait(void*,void*,const struct timespec*);
+int bionic_pthread_cond_signal(void*);
+int bionic_pthread_cond_broadcast(void*);
+int bionic_pthread_condattr_init(void*);
+int bionic_pthread_condattr_destroy(void*);
+int bionic_pthread_condattr_setclock(void*,int);
+int bionic_pthread_once(void*,void(*)(void));
+int bionic_pthread_key_create(int*,void(*)(void*));
+int bionic_pthread_key_delete(int);
+int bionic_pthread_setspecific(int,const void*);
+void *bionic_pthread_getspecific(int);
+int __cxa_guard_acquire_soloader(uint64_t*);
+void __cxa_guard_release_soloader(uint64_t*);
+void __cxa_guard_abort_soloader(uint64_t*);
 void *dlsym_soloader(void*,const char*);
 void *mmap64_soloader(void*,size_t,int,int,int,long long);
 int ret0(void); int ret1(void); int ret_neg1(void); void ret_void(void);
 void *__memclr_wrapper(void *s, size_t n);
+void *__aeabi_memset_wrapper(void *d, size_t n, int c);
+int fputc_soloader(int c, FILE *stream);
+int fputs_soloader(const char *s, FILE *stream);
+int fprintf_soloader(FILE *stream, const char *format, ...);
+int vfprintf_soloader(FILE *stream, const char *format, va_list ap);
+int fflush_soloader(FILE *stream);
+#include <zlib.h>
+gzFile gzopen_soloader(const char *path, const char *mode);
+int gzwrite_soloader(gzFile file, const void *buf, unsigned len);
+int gzclose_soloader(gzFile file);
+ssize_t write_soloader(int fd, const void *buf, size_t nbyte);
+FILE *fdopen_soloader(int fd, const char *mode);
+int fileno_soloader(FILE *stream);
 void *memalign_soloader(size_t a, size_t n);
 void exit_soloader(int status);
 void abort_soloader(void);
 void *memmem_soloader(const void *h, size_t hl, const void *n, size_t nl);
 void sincos_soloader(double x, double *s, double *c);
 void sincosf_soloader(float x, float *s, float *c);
+FILE *fopen_soloader(const char*,const char*);
+int open_soloader(const char*,int,...);
+int stat_soloader(const char*,struct stat*);
+size_t fread_soloader(void*,size_t,size_t,FILE*);
+int fseek_soloader(FILE*,long,int);
+long ftell_soloader(FILE*);
+int fclose_soloader(FILE*);
+size_t fwrite_soloader(const void*,size_t,size_t,FILE*);
+FILE *freopen_soloader(const char*,const char*,FILE*);
+int sscanf_soloader(const char *str, const char *fmt, ...);
+int vsscanf_soloader(const char *str, const char *fmt, va_list ap);
 int vasprintf_soloader(char **strp, const char *fmt, va_list ap);
+void free_soloader(void*);
+void *malloc_soloader(size_t);
+void *memset_soloader(void*, int, size_t);
 extern void *__cxa_atexit;
 extern void *__cxa_finalize;
 extern void *__cxa_guard_acquire;
@@ -80,19 +145,27 @@ extern void *__cxa_guard_release;
 extern void *__cxa_pure_virtual;
 extern void *__dynamic_cast;
 extern void *__gxx_personality_v0;
-extern void *__gnu_Unwind_Find_exidx;
+/* Implemented in lib/so_util/so_util.c (ARM EHABI exidx lookup). */
+uintptr_t gnu_Unwind_Find_exidx_soloader(uintptr_t pc, int *pcount);
 
-extern void _ZNKSt11logic_error4whatEv();
-extern void _ZNKSt13bad_exception4whatEv();
-extern void _ZNKSt13runtime_error4whatEv();
-extern void _ZNSt11logic_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE();
-extern void _ZNSt13runtime_errorC1EPKc();
-extern void _ZNSt13runtime_errorC1ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE();
-extern void _ZNSt13runtime_errorC2EPKc();
-extern void _ZNSt13runtime_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE();
-extern void _ZNSt13runtime_errorC2ERKS_();
-extern void _ZNSt16invalid_argumentD1Ev();
-extern void _ZNSt16invalid_argumentD2Ev();
+/* NOTE: C++ exception-runtime symbols (std::runtime_error/logic_error ctors,
+ * what(), etc.) are intentionally NOT listed here. The game ships its own
+ * libc++_shared.so (in its DT_NEEDED) and must bind to those, NOT to the
+ * loader's libstdc++: libc++'s std::__ndk1::string layout differs from
+ * libstdc++'s std::string, so forwarding e.g. the __ndk1 string ctors to
+ * libstdc++ corrupts the object and crashes (seen 2026-10-06: data abort in
+ * std::string copy ctor during exception handling). so_resolve() prefers
+ * DT_NEEDED modules over this table, so removing these entries lets the
+ * game use its own libc++ implementations.
+ *
+ * Deliberate exceptions to that rule (all ABI-neutral: pointers and scalars):
+ * - __gnu_Unwind_Find_exidx: the game unwinder import, implemented for real
+ *   in lib/so_util/so_util.c over the PT_ARM_EXIDX ranges recorded at load.
+ * - __cxa_pure_virtual -> abort: honest C++ semantics for a pure-virtual call.
+ * - _Znwj/_Znaj/_ZdlPv/_ZdaPv -> malloc/free: only ever used as a fallback
+ *   (so_resolve prefers DT_NEEDED, so libengine.so still binds these to its
+ *   own libc++_shared.so); lets libfmod.so (no libc++ in DT_NEEDED) allocate
+ *   with a consistent pair instead of dying in the unknown-symbol stub. */
 
 so_default_dynlib default_dynlib[] = {
     { "AAssetManager_fromJava", (uintptr_t)&AAssetManager_fromJava },
@@ -105,17 +178,10 @@ so_default_dynlib default_dynlib[] = {
     { "SL_IID_ENGINE", (uintptr_t)&SL_IID_ENGINE },
     { "SL_IID_PLAY", (uintptr_t)&SL_IID_PLAY },
     { "SL_IID_VOLUME", (uintptr_t)&SL_IID_VOLUME },
-    { "_ZNKSt11logic_error4whatEv", (uintptr_t)&_ZNKSt11logic_error4whatEv },
-    { "_ZNKSt13bad_exception4whatEv", (uintptr_t)&_ZNKSt13bad_exception4whatEv },
-    { "_ZNKSt13runtime_error4whatEv", (uintptr_t)&_ZNKSt13runtime_error4whatEv },
-    { "_ZNSt11logic_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE", (uintptr_t)&_ZNSt11logic_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE },
-    { "_ZNSt13runtime_errorC1EPKc", (uintptr_t)&_ZNSt13runtime_errorC1EPKc },
-    { "_ZNSt13runtime_errorC1ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE", (uintptr_t)&_ZNSt13runtime_errorC1ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE },
-    { "_ZNSt13runtime_errorC2EPKc", (uintptr_t)&_ZNSt13runtime_errorC2EPKc },
-    { "_ZNSt13runtime_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE", (uintptr_t)&_ZNSt13runtime_errorC2ERKNSt6__ndk112basic_stringIcNS0_11char_traitsIcEENS0_9allocatorIcEEEE },
-    { "_ZNSt13runtime_errorC2ERKS_", (uintptr_t)&_ZNSt13runtime_errorC2ERKS_ },
-    { "_ZNSt16invalid_argumentD1Ev", (uintptr_t)&_ZNSt16invalid_argumentD1Ev },
-    { "_ZNSt16invalid_argumentD2Ev", (uintptr_t)&_ZNSt16invalid_argumentD2Ev },
+    { "_ZdaPv", (uintptr_t)&free_soloader },
+    { "_ZdlPv", (uintptr_t)&free_soloader },
+    { "_Znaj", (uintptr_t)&malloc_soloader },
+    { "_Znwj", (uintptr_t)&malloc_soloader },
     { "__aeabi_memclr", (uintptr_t)&__memclr_wrapper },
     { "__aeabi_memclr4", (uintptr_t)&__memclr_wrapper },
     { "__aeabi_memclr8", (uintptr_t)&__memclr_wrapper },
@@ -125,14 +191,19 @@ so_default_dynlib default_dynlib[] = {
     { "__aeabi_memmove", (uintptr_t)&sceClibMemmove },
     { "__aeabi_memmove4", (uintptr_t)&sceClibMemmove },
     { "__aeabi_memmove8", (uintptr_t)&sceClibMemmove },
-    { "__aeabi_memset", (uintptr_t)&sceClibMemset },
-    { "__aeabi_memset8", (uintptr_t)&sceClibMemset },
+    { "__aeabi_memset", (uintptr_t)&__aeabi_memset_wrapper },
+    { "__aeabi_memset8", (uintptr_t)&__aeabi_memset_wrapper },
     { "__android_log_print", (uintptr_t)&__android_log_print },
     { "__android_log_write", (uintptr_t)&__android_log_write },
     { "__assert2", (uintptr_t)&__assert2_soloader },
     { "__cxa_atexit", (uintptr_t)&__cxa_atexit },
     { "__cxa_finalize", (uintptr_t)&__cxa_finalize },
+    { "__cxa_guard_abort", (uintptr_t)&__cxa_guard_abort_soloader },
+    { "__cxa_guard_acquire", (uintptr_t)&__cxa_guard_acquire_soloader },
+    { "__cxa_guard_release", (uintptr_t)&__cxa_guard_release_soloader },
+    { "__cxa_pure_virtual", (uintptr_t)&abort_soloader },
     { "__errno", (uintptr_t)&__errno_soloader },
+    { "__gnu_Unwind_Find_exidx", (uintptr_t)&gnu_Unwind_Find_exidx_soloader },
     { "__memcpy_chk", (uintptr_t)&__memcpy_chk },
     { "__memset_chk", (uintptr_t)&__memset_chk },
     { "__open_2", (uintptr_t)&__open_2 },
@@ -153,7 +224,7 @@ so_default_dynlib default_dynlib[] = {
     { "_setjmp", (uintptr_t)&setjmp },
     { "abort", (uintptr_t)&abort_soloader },
     { "accept", (uintptr_t)&ret_neg1 },
-    { "access", (uintptr_t)&access },
+    { "access", (uintptr_t)&access_soloader },
     { "acos", (uintptr_t)&acos },
     { "acosf", (uintptr_t)&acosf },
     { "adler32", (uintptr_t)&adler32 },
@@ -178,7 +249,10 @@ so_default_dynlib default_dynlib[] = {
     { "cos", (uintptr_t)&cos },
     { "cosf", (uintptr_t)&cosf },
     { "crc32", (uintptr_t)&crc32 },
-    { "ctime_r", (uintptr_t)&ctime_r },
+    { "asctime", (uintptr_t)&asctime_soloader },
+    { "asctime_r", (uintptr_t)&asctime_r_soloader },
+    { "ctime", (uintptr_t)&ctime_soloader },
+    { "ctime_r", (uintptr_t)&ctime_r_soloader },
     { "deflate", (uintptr_t)&deflate },
     { "deflateEnd", (uintptr_t)&deflateEnd },
     { "deflateInit2_", (uintptr_t)&deflateInit2_ },
@@ -206,38 +280,38 @@ so_default_dynlib default_dynlib[] = {
     { "expf", (uintptr_t)&expf },
     { "fchmod", (uintptr_t)&fchmod },
     { "fchown", (uintptr_t)&ret0 },
-    { "fclose", (uintptr_t)&fclose },
+    { "fclose", (uintptr_t)&fclose_soloader },
     { "fcntl", (uintptr_t)&fcntl },
-    { "fdopen", (uintptr_t)&fdopen },
+    { "fdopen", (uintptr_t)&fdopen_soloader },
     { "feof", (uintptr_t)&feof },
     { "ferror", (uintptr_t)&ferror },
-    { "fflush", (uintptr_t)&fflush },
+    { "fflush", (uintptr_t)&fflush_soloader },
     { "fgetc", (uintptr_t)&fgetc },
     { "fgets", (uintptr_t)&fgets },
-    { "fileno", (uintptr_t)&fileno },
+    { "fileno", (uintptr_t)&fileno_soloader },
     { "flockfile", (uintptr_t)&ret_void },
     { "floor", (uintptr_t)&floor },
     { "floorf", (uintptr_t)&floorf },
     { "fmod", (uintptr_t)&fmod },
     { "fmodf", (uintptr_t)&fmodf },
-    { "fopen", (uintptr_t)&fopen },
-    { "fprintf", (uintptr_t)&fprintf },
-    { "fputc", (uintptr_t)&fputc },
-    { "fputs", (uintptr_t)&fputs },
-    { "fread", (uintptr_t)&fread },
-    { "free", (uintptr_t)&free },
+    { "fopen", (uintptr_t)&fopen_soloader },
+    { "fprintf", (uintptr_t)&fprintf_soloader },
+    { "fputc", (uintptr_t)&fputc_soloader },
+    { "fputs", (uintptr_t)&fputs_soloader },
+    { "fread", (uintptr_t)&fread_soloader },
+    { "free", (uintptr_t)&free_soloader },
     { "freeaddrinfo", (uintptr_t)&ret0 },
-    { "freopen", (uintptr_t)&freopen },
+    { "freopen", (uintptr_t)&freopen_soloader },
     { "frexp", (uintptr_t)&frexp },
-    { "fseek", (uintptr_t)&fseek },
+    { "fseek", (uintptr_t)&fseek_soloader },
     { "fseeko", (uintptr_t)&fseek },
     { "fstat", (uintptr_t)&fstat },
     { "fsync", (uintptr_t)&fsync },
-    { "ftell", (uintptr_t)&ftell },
+    { "ftell", (uintptr_t)&ftell_soloader },
     { "ftello", (uintptr_t)&ftell },
     { "ftruncate64", (uintptr_t)&ftruncate },
     { "funlockfile", (uintptr_t)&ret_void },
-    { "fwrite", (uintptr_t)&fwrite },
+    { "fwrite", (uintptr_t)&fwrite_soloader },
     { "getaddrinfo", (uintptr_t)&ret_neg1 },
     { "getc", (uintptr_t)&getc },
     { "getc_unlocked", (uintptr_t)&getc_unlocked },
@@ -252,7 +326,7 @@ so_default_dynlib default_dynlib[] = {
     { "getsockname", (uintptr_t)&ret_neg1 },
     { "getsockopt", (uintptr_t)&ret_neg1 },
     { "gettid", (uintptr_t)&ret0 },
-    { "gettimeofday", (uintptr_t)&gettimeofday },
+    { "gettimeofday", (uintptr_t)&gettimeofday_soloader },
     { "getuid", (uintptr_t)&ret0 },
     { "glBindFramebufferOES", (uintptr_t)&glBindFramebufferOES },
     { "glBindTexture", (uintptr_t)&glBindTexture },
@@ -292,12 +366,12 @@ so_default_dynlib default_dynlib[] = {
     { "glTranslatef", (uintptr_t)&glTranslatef },
     { "glVertexPointer", (uintptr_t)&glVertexPointer },
     { "glViewport", (uintptr_t)&glViewport },
-    { "gmtime", (uintptr_t)&gmtime },
-    { "gmtime_r", (uintptr_t)&gmtime_r },
-    { "gzclose", (uintptr_t)&gzclose },
-    { "gzopen", (uintptr_t)&gzopen },
+    { "gmtime", (uintptr_t)&gmtime_soloader },
+    { "gmtime_r", (uintptr_t)&gmtime_r_soloader },
+    { "gzclose", (uintptr_t)&gzclose_soloader },
+    { "gzopen", (uintptr_t)&gzopen_soloader },
     { "gzread", (uintptr_t)&gzread },
-    { "gzwrite", (uintptr_t)&gzwrite },
+    { "gzwrite", (uintptr_t)&gzwrite_soloader },
     { "if_indextoname", (uintptr_t)&ret0 },
     { "if_nametoindex", (uintptr_t)&ret0 },
     { "inet_addr", (uintptr_t)&ret_neg1 },
@@ -336,8 +410,8 @@ so_default_dynlib default_dynlib[] = {
     { "ldexpf", (uintptr_t)&ldexpf },
     { "listen", (uintptr_t)&ret_neg1 },
     { "localeconv", (uintptr_t)&localeconv },
-    { "localtime", (uintptr_t)&localtime },
-    { "localtime_r", (uintptr_t)&localtime_r },
+    { "localtime", (uintptr_t)&localtime_soloader },
+    { "localtime_r", (uintptr_t)&localtime_r_soloader },
     { "log", (uintptr_t)&log },
     { "log10", (uintptr_t)&log10 },
     { "log10f", (uintptr_t)&log10f },
@@ -346,7 +420,7 @@ so_default_dynlib default_dynlib[] = {
     { "longjmp", (uintptr_t)&longjmp },
     { "lrand48", (uintptr_t)&lrand48 },
     { "lseek64", (uintptr_t)&lseek },
-    { "malloc", (uintptr_t)&malloc },
+    { "malloc", (uintptr_t)&malloc_soloader },
     { "mbrlen", (uintptr_t)&mbrlen },
     { "memalign", (uintptr_t)&memalign_soloader },
     { "memchr", (uintptr_t)&memchr },
@@ -354,16 +428,16 @@ so_default_dynlib default_dynlib[] = {
     { "memcpy", (uintptr_t)&memcpy },
     { "memmem", (uintptr_t)&memmem_soloader },
     { "memmove", (uintptr_t)&memmove },
-    { "memset", (uintptr_t)&memset },
+    { "memset", (uintptr_t)&memset_soloader },
     { "mkdir", (uintptr_t)&mkdir },
     { "mkstemp", (uintptr_t)&mkstemp },
-    { "mktime", (uintptr_t)&mktime },
+    { "mktime", (uintptr_t)&mktime_soloader },
     { "mmap64", (uintptr_t)&mmap64_soloader },
     { "modf", (uintptr_t)&modf },
     { "mremap", (uintptr_t)&ret0 },
     { "munmap", (uintptr_t)&ret0 },
     { "nanosleep", (uintptr_t)&nanosleep },
-    { "open", (uintptr_t)&open },
+    { "open", (uintptr_t)&open_soloader },
     { "opendir", (uintptr_t)&opendir },
     { "pause", (uintptr_t)&ret0 },
     { "pclose", (uintptr_t)&ret_neg1 },
@@ -378,34 +452,34 @@ so_default_dynlib default_dynlib[] = {
     { "pthread_attr_init", (uintptr_t)&pthread_attr_init },
     { "pthread_attr_setdetachstate", (uintptr_t)&pthread_attr_setdetachstate },
     { "pthread_attr_setstacksize", (uintptr_t)&pthread_attr_setstacksize },
-    { "pthread_cond_broadcast", (uintptr_t)&pthread_cond_broadcast },
-    { "pthread_cond_destroy", (uintptr_t)&pthread_cond_destroy },
-    { "pthread_cond_init", (uintptr_t)&pthread_cond_init },
-    { "pthread_cond_signal", (uintptr_t)&pthread_cond_signal },
-    { "pthread_cond_timedwait", (uintptr_t)&pthread_cond_timedwait },
-    { "pthread_cond_wait", (uintptr_t)&pthread_cond_wait },
-    { "pthread_condattr_destroy", (uintptr_t)&pthread_condattr_destroy },
-    { "pthread_condattr_init", (uintptr_t)&pthread_condattr_init },
-    { "pthread_condattr_setclock", (uintptr_t)&pthread_condattr_setclock },
+    { "pthread_cond_broadcast", (uintptr_t)&bionic_pthread_cond_broadcast },
+    { "pthread_cond_destroy", (uintptr_t)&bionic_pthread_cond_destroy },
+    { "pthread_cond_init", (uintptr_t)&bionic_pthread_cond_init },
+    { "pthread_cond_signal", (uintptr_t)&bionic_pthread_cond_signal },
+    { "pthread_cond_timedwait", (uintptr_t)&bionic_pthread_cond_timedwait },
+    { "pthread_cond_wait", (uintptr_t)&bionic_pthread_cond_wait },
+    { "pthread_condattr_destroy", (uintptr_t)&bionic_pthread_condattr_destroy },
+    { "pthread_condattr_init", (uintptr_t)&bionic_pthread_condattr_init },
+    { "pthread_condattr_setclock", (uintptr_t)&bionic_pthread_condattr_setclock },
     { "pthread_create", (uintptr_t)&pthread_create_soloader },
     { "pthread_detach", (uintptr_t)&pthread_detach },
     { "pthread_equal", (uintptr_t)&pthread_equal },
-    { "pthread_getspecific", (uintptr_t)&pthread_getspecific },
+    { "pthread_getspecific", (uintptr_t)&bionic_pthread_getspecific },
     { "pthread_join", (uintptr_t)&pthread_join },
-    { "pthread_key_create", (uintptr_t)&pthread_key_create },
-    { "pthread_key_delete", (uintptr_t)&pthread_key_delete },
-    { "pthread_mutex_destroy", (uintptr_t)&pthread_mutex_destroy },
-    { "pthread_mutex_init", (uintptr_t)&pthread_mutex_init },
-    { "pthread_mutex_lock", (uintptr_t)&pthread_mutex_lock },
-    { "pthread_mutex_trylock", (uintptr_t)&pthread_mutex_trylock },
-    { "pthread_mutex_unlock", (uintptr_t)&pthread_mutex_unlock },
-    { "pthread_mutexattr_destroy", (uintptr_t)&pthread_mutexattr_destroy },
-    { "pthread_mutexattr_init", (uintptr_t)&pthread_mutexattr_init },
-    { "pthread_mutexattr_settype", (uintptr_t)&pthread_mutexattr_settype },
-    { "pthread_once", (uintptr_t)&pthread_once },
+    { "pthread_key_create", (uintptr_t)&bionic_pthread_key_create },
+    { "pthread_key_delete", (uintptr_t)&bionic_pthread_key_delete },
+    { "pthread_mutex_destroy", (uintptr_t)&bionic_pthread_mutex_destroy },
+    { "pthread_mutex_init", (uintptr_t)&bionic_pthread_mutex_init },
+    { "pthread_mutex_lock", (uintptr_t)&bionic_pthread_mutex_lock },
+    { "pthread_mutex_trylock", (uintptr_t)&bionic_pthread_mutex_trylock },
+    { "pthread_mutex_unlock", (uintptr_t)&bionic_pthread_mutex_unlock },
+    { "pthread_mutexattr_destroy", (uintptr_t)&bionic_pthread_mutexattr_destroy },
+    { "pthread_mutexattr_init", (uintptr_t)&bionic_pthread_mutexattr_init },
+    { "pthread_mutexattr_settype", (uintptr_t)&bionic_pthread_mutexattr_settype },
+    { "pthread_once", (uintptr_t)&bionic_pthread_once },
     { "pthread_self", (uintptr_t)&pthread_self },
     { "pthread_setname_np", (uintptr_t)&ret0 },
-    { "pthread_setspecific", (uintptr_t)&pthread_setspecific },
+    { "pthread_setspecific", (uintptr_t)&bionic_pthread_setspecific },
     { "putc", (uintptr_t)&putc },
     { "putchar", (uintptr_t)&putchar },
     { "puts", (uintptr_t)&puts },
@@ -449,8 +523,8 @@ so_default_dynlib default_dynlib[] = {
     { "snprintf", (uintptr_t)&snprintf },
     { "socket", (uintptr_t)&ret_neg1 },
     { "sprintf", (uintptr_t)&sprintf },
-    { "sscanf", (uintptr_t)&sscanf },
-    { "stat", (uintptr_t)&stat },
+    { "sscanf", (uintptr_t)&sscanf_soloader },
+    { "stat", (uintptr_t)&stat_soloader },
     { "strcasecmp", (uintptr_t)&strcasecmp },
     { "strcat", (uintptr_t)&strcat },
     { "strchr", (uintptr_t)&strchr },
@@ -486,7 +560,7 @@ so_default_dynlib default_dynlib[] = {
     { "system", (uintptr_t)&ret_neg1 },
     { "tan", (uintptr_t)&tan },
     { "tanf", (uintptr_t)&tanf },
-    { "time", (uintptr_t)&time },
+    { "time", (uintptr_t)&time_soloader },
     { "tmpfile", (uintptr_t)&tmpfile },
     { "tolower", (uintptr_t)&tolower },
     { "toupper", (uintptr_t)&toupper },
@@ -497,11 +571,11 @@ so_default_dynlib default_dynlib[] = {
     { "usleep", (uintptr_t)&usleep },
     { "utimes", (uintptr_t)&utimes },
     { "vasprintf", (uintptr_t)&vasprintf_soloader },
-    { "vfprintf", (uintptr_t)&vfprintf },
+    { "vfprintf", (uintptr_t)&vfprintf_soloader },
     { "vprintf", (uintptr_t)&vprintf },
     { "vsnprintf", (uintptr_t)&vsnprintf },
     { "vsprintf", (uintptr_t)&vsprintf },
-    { "vsscanf", (uintptr_t)&vsscanf },
+    { "vsscanf", (uintptr_t)&vsscanf_soloader },
     { "vswprintf", (uintptr_t)&vswprintf },
     { "wcscoll", (uintptr_t)&wcscoll },
     { "wcscpy", (uintptr_t)&wcscpy },
@@ -514,7 +588,7 @@ so_default_dynlib default_dynlib[] = {
     { "wmemcpy", (uintptr_t)&wmemcpy },
     { "wmemmove", (uintptr_t)&wmemmove },
     { "wmemset", (uintptr_t)&wmemset },
-    { "write", (uintptr_t)&write },
+    { "write", (uintptr_t)&write_soloader },
 };
 
 const int default_dynlib_size = sizeof(default_dynlib);
