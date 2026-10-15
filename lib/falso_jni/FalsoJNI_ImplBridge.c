@@ -84,7 +84,9 @@ jsize getFieldTypeSize(FIELD_TYPE fieldType) {
 }
 
 jobject getObjectFieldValueById(jfieldID id) {
-    getFieldValueById(jobject, FIELD_TYPE_OBJECT, FieldsObject, fieldsObject, fieldsObject_size, id, (jobject)0x42424242);
+    // Bug 26: default was the 0x42424242 sentinel; the game misused it as a
+    // char* -> strlen crash. Use a heap dummy instead.
+    getFieldValueById(jobject, FIELD_TYPE_OBJECT, FieldsObject, fieldsObject, fieldsObject_size, id, falso_dummy_jobject());
 }
 
 jint getIntFieldValueById(jfieldID id) {

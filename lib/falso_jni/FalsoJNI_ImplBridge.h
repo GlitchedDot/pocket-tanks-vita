@@ -53,6 +53,10 @@ typedef struct { int id; jdouble value; }   FieldsDouble;
 jfieldID    getFieldIdByName(const char* name);
 jsize       getFieldTypeSize(FIELD_TYPE fieldType);
 
+/* Bug 26: heap dummy jobject used instead of the 0x42424242 sentinel
+ * (the game misused the sentinel as a char* -> strlen crash). */
+jobject     falso_dummy_jobject(void);
+
 jobject     getObjectFieldValueById(jfieldID id);
 jboolean    getBooleanFieldValueById(jfieldID id);
 jbyte       getByteFieldValueById(jfieldID id);
