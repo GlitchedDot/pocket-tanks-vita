@@ -60,12 +60,28 @@ AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
         f = fopen(path, "r+b");
         if (f)
             is_data_fallback = 1;
-        else
+        else {
             f = fopen(path, "rb");
+            if (!f) {
+                // Bug 38 (spritecache): the engine creates its sprite
+                // caches as "<name>.spritecache.tmp" through
+                // AAssetManager_open; "r+b"/"rb" can never create the
+                // file, so the three caches could never be born and
+                // their rebuild cost was re-paid on every boot (and
+                // the atlases never persisted). Scope creation to
+                // .tmp targets so no read path can truncate a file;
+                // a .tmp already present at open time is a stale
+                // rebuild artifact, safe to truncate.
+                size_t plen = strlen(path);
+                if (plen > 4 && strcmp(path + plen - 4, ".tmp") == 0) {
+                    f = fopen(path, "w+b");
+                    if (f)
+                        is_data_fallback = 1;
+                }
+            }
+        }
     }
-    blog("IO: asset_open(\"%s\") -> \"%s\" %p%s caller=%p", filename, path, (void *)f,
-         is_data_fallback ? " (data-dir rw)" : "",
-         __builtin_return_address(0));
+    (void)is_data_fallback; /* only the removed IO trace read it */
     if (!f) {
         log_warn("AAssetManager_open: not found: %s", filename);
         return NULL;
@@ -77,11 +93,10 @@ AAsset *AAssetManager_open(AAssetManager *mgr, const char *filename, int mode) {
         return NULL;
     }
     a->f = f;
-    // Bug 21: log the AAsset* token too (the game may use it as a cookie),
-    // and register the FILE* so the write-path wrappers can flag writes
-    // through asset handles.
-    blog("IO: asset_open(\"%s\") -> AAsset %p (FILE %p)", filename, (void *)a,
-         (void *)f);
+    // Bug 21: register the FILE* so the write-path wrappers can flag
+    // writes through asset handles. (Build M removed the asset_open IO
+    // traces; the open/fallback logic above is unchanged — including
+    // the mode handling the pending spritecache fix will revisit.)
     track_asset_file_soloader(f);
     fseek(f, 0, SEEK_END);
     a->size = ftell(f);

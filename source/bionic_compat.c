@@ -2,9 +2,11 @@
 // that don't exist in the VitaSDK.
 #include "utils.h"
 #include "bootlog.h"
+#include "sound.h"
 
 #include <psp2/io/stat.h>
 #include <psp2/kernel/processmgr.h>
+#include <psp2/kernel/rng.h>
 #include <psp2/kernel/threadmgr.h>
 #include <psp2/rtc.h>
 
@@ -117,26 +119,159 @@ int __vsprintf_chk(char *s, int flag, size_t slen, const char *fmt, va_list ap) 
     return vsprintf(s, fmt, ap);
 }
 
+// Forward declaration (defined in the Bug 35 block below): __read_chk must
+// honor the /dev/urandom virtual fds just like the engine's read import.
+ssize_t read_soloader(int fd, void *buf, size_t n);
+
 size_t __read_chk(int fd, void *buf, size_t n, size_t buflen) {
     (void)buflen;
-    return read(fd, buf, n);
+    return read_soloader(fd, buf, n);
 }
 
 // Forward declaration (defined below with the other IO wrappers).
 static void normalize_path_soloader(const char *in, char *out, size_t outsz);
+
+// ---------------------------------------------------------------------------
+// Bug 35: /dev/urandom + /dev/random shim.
+// At game start the engine constructs a boost::uuids random generator; its
+// entropy source opens "/dev/urandom" through the imported open family
+// (ctor at libengine ~0x2AD9B8: open(path, 0x8002), fd < 0 -> throw
+// boost::wrapexcept<boost::uuids::entropy_error> "open /dev/urandom").
+// The Vita has no such device, so newlib open() failed and the uncaught
+// exception aborted the process (bootlog-24, frame ~10265, right after the
+// final setup taps). Serve the two device paths from the kernel RNG via a
+// small virtual-fd table; reads always fill the full request (a character
+// device never EOFs). The stdio form (fopen) is covered too: a registered
+// fmemopen-backed FILE whose fread is intercepted and filled the same way.
+// Full write-up: bug35-analysis.md.
+// ---------------------------------------------------------------------------
+#define URAND_FD_BASE 0x1000
+#define URAND_FD_MAX 16
+static volatile int urand_lock = 0;
+static int urand_fd_used[URAND_FD_MAX];
+static int urand_logged = 0;
+
+static void urand_spin_lock(void) {
+    while (__sync_lock_test_and_set(&urand_lock, 1)) { }
+}
+static void urand_spin_unlock(void) { __sync_lock_release(&urand_lock); }
+
+static int urand_is_path(const char *p) {
+    return p && (!strcmp(p, "/dev/urandom") || !strcmp(p, "/dev/random"));
+}
+
+static void urand_log_once(const char *path) {
+    if (!urand_logged) {
+        urand_logged = 1;
+        blog("URANDOM: %s served from kernel RNG", path);
+    }
+}
+
+static void urand_fill(void *buf, size_t n) {
+    unsigned char *p = (unsigned char *)buf;
+    while (n) {
+        size_t chunk = n > 1024 ? 1024 : n;
+        if (sceKernelGetRandomNumber(p, (SceSize)chunk) < 0) {
+            // Never fail the game over entropy: LCG fallback fill.
+            static uint32_t seed = 0x2545F491u;
+            for (size_t i = 0; i < chunk; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                p[i] = (unsigned char)(seed >> 24);
+            }
+        }
+        p += chunk;
+        n -= chunk;
+    }
+}
+
+static int urand_open_fd(const char *path) {
+    urand_spin_lock();
+    for (int i = 0; i < URAND_FD_MAX; i++) {
+        if (!urand_fd_used[i]) {
+            urand_fd_used[i] = 1;
+            urand_spin_unlock();
+            urand_log_once(path);
+            return URAND_FD_BASE + i;
+        }
+    }
+    urand_spin_unlock();
+    errno = EMFILE;
+    return -1;
+}
+
+static int urand_is_fd(int fd) {
+    return fd >= URAND_FD_BASE && fd < URAND_FD_BASE + URAND_FD_MAX &&
+           urand_fd_used[fd - URAND_FD_BASE];
+}
+
+ssize_t read_soloader(int fd, void *buf, size_t n) {
+    if (urand_is_fd(fd)) {
+        if (n)
+            urand_fill(buf, n);
+        return (ssize_t)n;
+    }
+    return read(fd, buf, n);
+}
+
+int close_soloader(int fd) {
+    if (urand_is_fd(fd)) {
+        urand_fd_used[fd - URAND_FD_BASE] = 0;
+        return 0;
+    }
+    return close(fd);
+}
+
+// stdio form: registered fmemopen FILEs whose fread bypasses the (finite)
+// backing buffer and fills from the RNG, so the stream never EOFs either.
+#define URAND_FILE_MAX 4
+static FILE *urand_files[URAND_FILE_MAX];
+static char urand_scratch[URAND_FILE_MAX][256];
+
+static FILE *urand_fopen(const char *path, const char *mode) {
+    urand_spin_lock();
+    for (int i = 0; i < URAND_FILE_MAX; i++) {
+        if (!urand_files[i]) {
+            FILE *f = fmemopen(urand_scratch[i], sizeof(urand_scratch[i]),
+                               mode ? mode : "rb");
+            if (!f)
+                f = fmemopen(urand_scratch[i], sizeof(urand_scratch[i]), "rb");
+            if (f)
+                urand_files[i] = f;
+            urand_spin_unlock();
+            if (f)
+                urand_log_once(path);
+            return f;
+        }
+    }
+    urand_spin_unlock();
+    errno = EMFILE;
+    return NULL;
+}
+
+static int urand_is_file(FILE *f) {
+    if (!f)
+        return 0;
+    for (int i = 0; i < URAND_FILE_MAX; i++)
+        if (urand_files[i] == f)
+            return 1;
+    return 0;
+}
+
+static void urand_forget_file(FILE *f) {
+    for (int i = 0; i < URAND_FILE_MAX; i++)
+        if (urand_files[i] == f)
+            urand_files[i] = NULL;
+}
 
 int __open_2(const char *path, int flags) {
     // NDK _FORTIFY_SOURCE redirects the game's open() calls here. Route
     // through the same path normalization + tracing as open_soloader.
     char norm[512];
     normalize_path_soloader(path, norm, sizeof(norm));
-    if (path && strcmp(path, norm) != 0)
-        blog("IO: __open_2 path normalized: \"%s\" -> \"%s\"", path, norm);
+    if (urand_is_path(norm))
+        return urand_open_fd(norm);
     errno = 0;
     int fd = open(norm, flags);
-    int e = errno;
-    blog("IO: __open_2(\"%s\", 0x%x) -> %d errno=%d", path ? path : "(null)",
-         flags, fd, fd >= 0 ? 0 : e);
     return fd;
 }
 
@@ -155,13 +290,45 @@ int pthread_create_soloader(pthread_t *thread, const void *attr,
 }
 
 // ---------------------------------------------------------------------------
-// dlsym: FMOD lazy-loads AAudio/OpenSL symbols; report them missing so it
-// falls back gracefully.
+// dlsym: FMOD lazy-loads AAudio/OpenSL symbols. Through Build AG
+// everything was reported missing so FMOD fell back to no output
+// device. Build AH serves the real OpenSL ES implementation (see
+// sound.c); AAudio symbols stay missing on purpose so FMOD picks
+// the OpenSL path, not the AAudio one.
 // ---------------------------------------------------------------------------
+/* Build BA: dlopen previously stubbed to ret1 (silent). Log every
+ * request to the bootlog so FMOD's library shopping is visible; the
+ * fake handle is accepted by dlsym_soloader below regardless. */
+void *dlopen_soloader(const char *filename, int flags) {
+    (void)flags;
+    blog("DLOPEN: '%s' -> fake handle", filename ? filename : "(null)");
+    return (void *)(uintptr_t)0x1001;
+}
+
 void *dlsym_soloader(void *handle, const char *symbol) {
     (void)handle;
-    log_info("dlsym(%s) -> NULL (stubbed)", symbol ? symbol : "(null)");
-    return NULL;
+    void *hit = NULL;
+    if (symbol) {
+        if (!strcmp(symbol, "slCreateEngine"))
+            hit = (void *)&slCreateEngine;
+        else if (!strcmp(symbol, "SL_IID_ENGINE"))
+            hit = (void *)&SL_IID_ENGINE;
+        else if (!strcmp(symbol, "SL_IID_PLAY"))
+            hit = (void *)&SL_IID_PLAY;
+        else if (!strcmp(symbol, "SL_IID_BUFFERQUEUE"))
+            hit = (void *)&SL_IID_BUFFERQUEUE;
+        else if (!strcmp(symbol, "SL_IID_ANDROIDSIMPLEBUFFERQUEUE"))
+            hit = (void *)&SL_IID_ANDROIDSIMPLEBUFFERQUEUE;
+        else if (!strcmp(symbol, "SL_IID_ANDROIDCONFIGURATION"))
+            hit = (void *)&SL_IID_ANDROIDCONFIGURATION;
+        else if (!strcmp(symbol, "SL_IID_RECORD"))
+            hit = (void *)&SL_IID_RECORD;
+        else if (!strcmp(symbol, "SL_IID_VOLUME"))
+            hit = (void *)&SL_IID_VOLUME;
+    }
+    blog("DLSYM: '%s' -> %s", symbol ? symbol : "(null)",
+         hit ? "served" : "NULL");
+    return hit;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,17 +382,19 @@ void *__aeabi_memset_wrapper(void *dest, size_t n, int c) {
     return memset(dest, c, n);
 }
 
-void *memalign_soloader(size_t alignment, size_t size) {
-    // posix_memalign isn't in Vita newlib; align manually.
-    // NOTE: free() on the result leaks; acceptable for game use.
-    void *raw = malloc(size + alignment + sizeof(void *));
-    if (!raw)
-        return NULL;
-    uintptr_t aligned = ((uintptr_t)raw + sizeof(void *) + alignment - 1) & ~(alignment - 1);
-    ((void **)aligned)[-1] = raw;
-    heap_track(raw, size + alignment + sizeof(void *));
-    return (void *)aligned;
-}
+// ---------------------------------------------------------------------------
+// Bug 30: memalign_soloader REMOVED -- do not resurrect. Its layout stored
+// the raw malloc pointer in the word at aligned-4, exactly where dlmalloc
+// keeps the chunk size, so any plain free() of an aligned allocation read
+// a pointer as a size and data-aborted. Harmless while nothing freed
+// aligned memory ("free() leaks; acceptable" era), fatal the moment
+// libc++abi's __cxa_free_exception freed exception storage allocated via
+// the memalign import (first caught exception, build D run). dynlib.c now
+// binds "memalign" DIRECTLY to newlib's memalign, whose chunks are native
+// dlmalloc chunks and free()-able -- the bionic invariant. The only loss
+// is diagnostic: aligned allocations no longer extend the heap_track
+// scan range (malloc_soloader still tracks the main arena).
+// ---------------------------------------------------------------------------
 
 void exit_soloader(int status) {
     log_info("exit(%d) called by game", status);
@@ -318,6 +487,14 @@ extern void *__gnu_Unwind_Find_exidx;
 // "ux0:data/pockettanks//engine.cfg".
 // ---------------------------------------------------------------------------
 static void normalize_path_soloader(const char *in, char *out, size_t outsz) {
+    // Build AW: FMOD's NDK cpufeatures reads /proc/cpuinfo to detect
+    // NEON; the Vita has no /proc, so FMOD found no features and
+    // System_Create refused (error 41). main() writes a truthful
+    // Cortex-A9 cpuinfo into the datadir; serve it for that path.
+    if (in && strcmp(in, "/proc/cpuinfo") == 0) {
+        snprintf(out, outsz, "ux0:data/pockettanks/cpuinfo");
+        return;
+    }
     // Relative paths (no drive ':' and not '/'-rooted): the game assumes the
     // process CWD is its files dir (true on Android, not on Vita). Resolve
     // them against the data dir before anything else.
@@ -361,13 +538,10 @@ static int is_tracked_soloader(FILE *f) {
 FILE *fopen_soloader(const char *path, const char *mode) {
     char norm[512];
     normalize_path_soloader(path, norm, sizeof(norm));
-    if (path && strcmp(path, norm) != 0)
-        blog("IO: fopen path normalized: \"%s\" -> \"%s\"", path, norm);
+    if (urand_is_path(norm))
+        return urand_fopen(norm, mode);
     errno = 0;
     FILE *f = fopen(norm, mode);
-    int e = errno;
-    blog("IO: fopen(\"%s\", \"%s\") -> %p errno=%d", path ? path : "(null)",
-         mode ? mode : "(null)", (void *)f, f ? 0 : e);
     track_stream_soloader(f, path);
     return f;
 }
@@ -375,8 +549,8 @@ FILE *fopen_soloader(const char *path, const char *mode) {
 int open_soloader(const char *path, int flags, ...) {
     char norm[512];
     normalize_path_soloader(path, norm, sizeof(norm));
-    if (path && strcmp(path, norm) != 0)
-        blog("IO: open path normalized: \"%s\" -> \"%s\"", path, norm);
+    if (urand_is_path(norm))
+        return urand_open_fd(norm);
     int mode = 0;
     if (flags & O_CREAT) {
         va_list ap;
@@ -386,9 +560,8 @@ int open_soloader(const char *path, int flags, ...) {
     }
     errno = 0;
     int fd = open(norm, flags, mode);
-    int e = errno;
-    blog("IO: open(\"%s\", 0x%x) -> %d errno=%d", path ? path : "(null)",
-         flags, fd, fd >= 0 ? 0 : e);
+    if (strstr(path, "cpuinfo"))
+        blog("CPUINFO: open '%s' -> '%s' fd %d errno %d", path, norm, fd, errno);
     return fd;
 }
 
@@ -397,8 +570,6 @@ int stat_soloader(const char *path, struct stat *st) {
     normalize_path_soloader(path, norm, sizeof(norm));
     errno = 0;
     int r = stat(norm, st);
-    int e = errno;
-    blog("IO: stat(\"%s\") -> %d errno=%d", path ? path : "(null)", r, r == 0 ? 0 : e);
     return r;
 }
 
@@ -408,13 +579,10 @@ int access_soloader(const char *path, int mode) {
     // fails on that, so normalize first like the other IO wrappers.
     char norm[512];
     normalize_path_soloader(path, norm, sizeof(norm));
-    if (path && strcmp(path, norm) != 0)
-        blog("IO: access path normalized: \"%s\" -> \"%s\"", path, norm);
+    if (urand_is_path(norm))
+        return 0;
     errno = 0;
     int r = access(norm, mode);
-    int e = errno;
-    blog("IO: access(\"%s\", %d) -> %d errno=%d", path ? path : "(null)", mode,
-         r, r == 0 ? 0 : e);
     return r;
 }
 
@@ -444,6 +612,67 @@ int gettimeofday_soloader(struct timeval *tv, void *tz) {
         tv->tv_usec = (suseconds_t)(tick.tick % 1000000ULL);
     }
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// clock_gettime (Bug 31): dynlib previously bound the engine's import to
+// newlib's clock_gettime, whose CLOCK_MONOTONIC branch is an RTC wall-clock
+// conversion (sceRtcGetCurrentClock + sceRtcGetTime_t), never verified on
+// hardware in this port. The engine derives its per-frame delta (timePassed,
+// ms) from clock_gettime(CLOCK_MONOTONIC), and INTRO2's timed sequence
+// accumulates those deltas — with delta == 0 every frame it never leaves
+// its opening step and never requests the TITLE scene. Serve the engine
+// from primitives that cannot stall:
+//   - monotonic family: sceKernelGetProcessTimeWide() (us since boot)
+//   - realtime family:  the same RTC-tick path as gettimeofday_soloader
+// The clk_id values arriving here are ANDROID's: the caller is the
+// bionic-compiled engine resolving through dynlib.c. newlib's own CLOCK_*
+// numbering differs (SDK time.h: CLOCK_REALTIME=1, CLOCK_MONOTONIC=4), so
+// switch on the Android constants below, never the SDK macros.
+// ---------------------------------------------------------------------------
+#define PT_CLK_REALTIME           0
+#define PT_CLK_MONOTONIC          1
+#define PT_CLK_PROCESS_CPUTIME_ID 2
+#define PT_CLK_THREAD_CPUTIME_ID  3
+#define PT_CLK_MONOTONIC_RAW      4
+#define PT_CLK_REALTIME_COARSE    5
+#define PT_CLK_MONOTONIC_COARSE   6
+#define PT_CLK_BOOTTIME           7
+
+int clock_gettime_soloader(int clk_id, struct timespec *tp) {
+    if (!tp) {
+        errno = EFAULT;
+        return -1;
+    }
+    switch (clk_id) {
+    case PT_CLK_MONOTONIC:
+    case PT_CLK_MONOTONIC_RAW:
+    case PT_CLK_MONOTONIC_COARSE:
+    case PT_CLK_BOOTTIME:
+    case PT_CLK_PROCESS_CPUTIME_ID:
+    case PT_CLK_THREAD_CPUTIME_ID: {
+        uint64_t us = sceKernelGetProcessTimeWide();
+        tp->tv_sec = (time_t)(us / 1000000ULL);
+        tp->tv_nsec = (long)((us % 1000000ULL) * 1000ULL);
+        break;
+    }
+    case PT_CLK_REALTIME:
+    case PT_CLK_REALTIME_COARSE: {
+        SceRtcTick tick = { 0 };
+        sceRtcGetCurrentTick(&tick);
+        // tick is us since 0001-01-01; shift to the Unix epoch in 64-bit.
+        uint64_t us = tick.tick - 62135596800000000ULL;
+        tp->tv_sec = (time_t)(us / 1000000ULL);
+        tp->tv_nsec = (long)((us % 1000000ULL) * 1000ULL);
+        break;
+    }
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+    /* Build M: the first-calls CLOCK trace is removed (diagnostics
+     * off); the clock behavior above is the Bug 31 fix, unchanged. */
+    return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -588,33 +817,35 @@ char *ctime_soloader(const time_t *t) {
     return ctime_r_soloader(t, ctime_buf_soloader);
 }
 
+/* Build M: the engine.cfg tracked-stream traces that used to wrap
+ * these four are removed (diagnostics off); the wrappers and the
+ * tracked-stream bookkeeping (fclose untracks) are unchanged. */
 size_t fread_soloader(void *ptr, size_t size, size_t nmemb, FILE *stream) {
-    size_t r = fread(ptr, size, nmemb, stream);
-    if (is_tracked_soloader(stream))
-        blog("IO: fread(engine.cfg stream, %u x %u) -> %u", (unsigned)size,
-             (unsigned)nmemb, (unsigned)r);
-    return r;
+    if (urand_is_file(stream)) {
+        // Bug 35: /dev/urandom stream — fill from the kernel RNG, never EOF.
+        if (size && nmemb)
+            urand_fill(ptr, size * nmemb);
+        return nmemb;
+    }
+    return fread(ptr, size, nmemb, stream);
 }
 
 int fseek_soloader(FILE *stream, long offset, int whence) {
-    int r = fseek(stream, offset, whence);
-    if (is_tracked_soloader(stream))
-        blog("IO: fseek(engine.cfg stream, %ld, %d) -> %d", offset, whence, r);
-    return r;
+    return fseek(stream, offset, whence);
 }
 
 long ftell_soloader(FILE *stream) {
-    long r = ftell(stream);
-    if (is_tracked_soloader(stream))
-        blog("IO: ftell(engine.cfg stream) -> %ld", r);
-    return r;
+    return ftell(stream);
 }
 
 int fclose_soloader(FILE *stream) {
+    if (urand_is_file(stream)) {
+        urand_forget_file(stream);
+        return fclose(stream);
+    }
     int was = is_tracked_soloader(stream);
     int r = fclose(stream);
     if (was) {
-        blog("IO: fclose(engine.cfg stream) -> %d", r);
         for (int i = 0; i < tracked_count; i++) {
             if (tracked_streams[i] == stream) {
                 tracked_streams[i] = NULL;
@@ -635,12 +866,11 @@ size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb,
                        FILE *stream) {
     size_t r = fwrite(ptr, size, nmemb, stream);
     if (r != nmemb) {
+        /* Kept in Build M: a short write is an error event, not a
+         * per-call trace (this is the Bug 19 "cp_fwrite failed" eye). */
         blog("IO: fwrite(%p, %u x %u) -> %u (SHORT) errno=%d",
              (void *)stream, (unsigned)size, (unsigned)nmemb, (unsigned)r,
              errno);
-    } else if (is_tracked_soloader(stream)) {
-        blog("IO: fwrite(engine.cfg stream, %u x %u) -> %u",
-             (unsigned)size, (unsigned)nmemb, (unsigned)r);
     }
     return r;
 }
@@ -648,14 +878,8 @@ size_t fwrite_soloader(const void *ptr, size_t size, size_t nmemb,
 FILE *freopen_soloader(const char *path, const char *mode, FILE *stream) {
     char norm[512];
     normalize_path_soloader(path, norm, sizeof(norm));
-    if (path && strcmp(path, norm) != 0)
-        blog("IO: freopen path normalized: \"%s\" -> \"%s\"", path, norm);
     errno = 0;
     FILE *f = freopen(norm, mode, stream);
-    int e = errno;
-    blog("IO: freopen(\"%s\", \"%s\", %p) -> %p errno=%d",
-         path ? path : "(null)", mode ? mode : "(null)", (void *)stream,
-         (void *)f, f ? 0 : e);
     return f;
 }
 
@@ -673,11 +897,12 @@ static int writelog_count = 0;
 static int is_asset_file_soloader(FILE *f);  // defined below (asset registry)
 
 static void writelog(const char *what, FILE *f) {
-    if (writelog_count >= WRITELOG_MAX)
-        return;
-    writelog_count++;
-    blog("IO: %s(stream=%p%s)", what, (void *)f,
-         is_asset_file_soloader(f) ? " [ASSET]" : "");
+    /* Build M: write-path tracing removed (diagnostics off). Kept as
+     * a no-op so the wrappers below stay byte-identical in behavior;
+     * the capped counter is gone with the log it fed. */
+    (void)what;
+    (void)f;
+    (void)writelog_count;
 }
 
 int fputc_soloader(int c, FILE *stream) {
@@ -690,11 +915,26 @@ int fputs_soloader(const char *s, FILE *stream) {
     return fputs(s, stream);
 }
 
+/* Build AT: the engine reports its FMOD failures with plain printf
+ * ("FMOD init error! (%d) %s" etc.), which lands on the Vita debug
+ * console — invisible in the bootlog. Tee any sound-related formatted
+ * line into blog() while passing the output through unchanged. */
+static void tee_check(const char *format, va_list ap) {
+    char buf[512];
+    va_list aq;
+    va_copy(aq, ap);
+    vsnprintf(buf, sizeof(buf), format, aq);
+    va_end(aq);
+    if (strstr(buf, "FMOD") || strstr(buf, "sfx") || strstr(buf, "Sfx") ||
+        strstr(buf, "SFX") || strstr(buf, "Sound") ||
+        strstr(buf, "OpenSL") || strstr(buf, "slCreate"))
+        blog("ENG: %s", buf);
+}
+
 int vfprintf_soloader(FILE *stream, const char *format, va_list ap) {
-    // Log format pointer first (separate call) so we get it even if format is bad.
-    // Then log the format string with a cap; vfprintf will read it anyway.
-    blog("IO: vfprintf(stream=%p, fmt=%p)", stream, format);
-    if (format) blog("IO: vfprintf fmt=\"%.128s\"", format);
+    /* Build M: the per-call format-pointer/format-string traces are
+     * removed; the va_copy + call mechanics are unchanged. */
+    tee_check(format, ap);
     va_list aq;
     va_copy(aq, ap);
     int r = vfprintf(stream, format, aq);
@@ -703,35 +943,39 @@ int vfprintf_soloader(FILE *stream, const char *format, va_list ap) {
 }
 
 int fprintf_soloader(FILE *stream, const char *format, ...) {
-    blog("IO: fprintf(stream=%p, fmt=%p)", stream, format);
-    if (format) blog("IO: fprintf fmt=\"%.128s\"", format);
     va_list ap;
     va_start(ap, format);
-    int r = vfprintf(stream, format, ap);
+    int r = vfprintf_soloader(stream, format, ap);
     va_end(ap);
     return r;
 }
 
-// zlib wrappers with logging: the game may write configs via gzopen/gzwrite,
-// which would otherwise be invisible in the bootlog.
+int printf_soloader(const char *format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    tee_check(format, ap);
+    va_list aq;
+    va_copy(aq, ap);
+    int r = vfprintf(stdout, format, aq);
+    va_end(aq);
+    va_end(ap);
+    return r;
+}
+
+// zlib wrappers (Build M: their per-call logging is removed; the game
+// may write configs via gzopen/gzwrite — the calls are unchanged).
 gzFile gzopen_soloader(const char *path, const char *mode) {
-    blog("IO: gzopen(\"%s\", \"%s\")", path ? path : "(null)", mode ? mode : "(null)");
     gzFile g = gzopen(path, mode);
-    blog("IO: gzopen -> %p", g);
     return g;
 }
 
 int gzwrite_soloader(gzFile file, const void *buf, unsigned len) {
-    blog("IO: gzwrite(%p, %u bytes)", file, len);
     int r = gzwrite(file, buf, len);
-    blog("IO: gzwrite -> %d", r);
     return r;
 }
 
 int gzclose_soloader(gzFile file) {
-    blog("IO: gzclose(%p)", file);
     int r = gzclose(file);
-    blog("IO: gzclose -> %d", r);
     return r;
 }
 
@@ -740,30 +984,20 @@ int fflush_soloader(FILE *stream) {    writelog("fflush", stream);
 }
 
 ssize_t write_soloader(int fd, const void *buf, size_t nbyte) {
-    if (writelog_count < WRITELOG_MAX) {
-        writelog_count++;
-        blog("IO: write(fd=%d, n=%u)", fd, (unsigned)nbyte);
-    }
+    if (urand_is_fd(fd))
+        return (ssize_t)nbyte;  // Bug 35: harmless sink, like the device.
     return write(fd, buf, nbyte);
 }
 
 FILE *fdopen_soloader(int fd, const char *mode) {
+    if (urand_is_fd(fd))
+        return urand_fopen("/dev/urandom", mode);
     FILE *f = fdopen(fd, mode);
-    if (writelog_count < WRITELOG_MAX) {
-        writelog_count++;
-        blog("IO: fdopen(fd=%d, \"%s\") -> %p", fd, mode ? mode : "(null)",
-             (void *)f);
-    }
     return f;
 }
 
 int fileno_soloader(FILE *stream) {
     int r = fileno(stream);
-    if (writelog_count < WRITELOG_MAX) {
-        writelog_count++;
-        blog("IO: fileno(%p%s) -> %d", (void *)stream,
-             is_asset_file_soloader(stream) ? " [ASSET]" : "", r);
-    }
     return r;
 }
 
@@ -912,6 +1146,13 @@ void *memset_soloader(void *dst, int c, size_t n) {
 // plus a best-effort what() for known std::exception derivatives.
 // The heap scan answers the timing question: does the 0x0C corruption
 // predate the throw (writer ran during parse/serialize) or appear mid-unwind?
+//
+// Bug 29 update: the interposed entry points are no longer C functions in
+// this file -- they are naked asm tail-branch stubs in cxa_throw_stub.s
+// (a C hook frame on the throw path makes every throw uncatchable,
+// because the unwinder cannot step over eboot PCs). Only the logging
+// helpers (cxa_throw_log_from_hook / cxa_rethrow_log_from_hook) remain
+// here, called from the stubs with the original registers.
 // ---------------------------------------------------------------------------
 
 // Game-heap extent tracking: the malloc/memalign wrappers record the
@@ -981,8 +1222,9 @@ static const char *exception_what_guarded(void *ex, const char *mangled) {
     return what_fn(ex);
 }
 
-static void (*g_real_cxa_throw)(void *, void *, void (*)(void *)) = NULL;
-static void (*g_real_cxa_rethrow)(void) = NULL;
+// Non-static: referenced by the asm tail-branch stubs in cxa_throw_stub.s.
+void (*g_real_cxa_throw)(void *, void *, void (*)(void *)) = NULL;
+void (*g_real_cxa_rethrow)(void) = NULL;
 static void *(*g_cxa_current_exception_type)(void) = NULL;
 
 void cxa_throw_hook_init(void *real_throw, void *real_rethrow,
@@ -1001,8 +1243,31 @@ static const char *tinfo_mangled_name(void *tinfo) {
     return name ? name : "(null name)";
 }
 
-void __cxa_throw_soloader(void *ex, void *tinfo, void (*dest)(void *)) {
+// ---------------------------------------------------------------------------
+// Bug 29: the logging half of the throw hooks. The actual
+// __cxa_throw_soloader/__cxa_rethrow_soloader entry points are naked asm
+// stubs (cxa_throw_stub.s) that save r0-r2 + LR, call these helpers, then
+// restore every register and TAIL-BRANCH to the real __cxa_throw /
+// __cxa_rethrow. They must be asm: as C functions they left an EBOOT
+// frame on the stack, and since the eboot is not a registered module,
+// __gnu_Unwind_Find_exidx returns 0/0 for its PCs -- libunwind phase 1
+// could not step over the hook frame, never reached a game frame, and
+// every libengine throw terminated as "uncaught" (the real LOOP-token
+// bad_lexical_cast HAS a catch clause in the game; it was simply never
+// delivered). With the tail branch, the unwinder sees exactly the stack
+// a direct game -> real __cxa_throw call would have left.
+// ---------------------------------------------------------------------------
+
+// Called from the asm stub with the game's original arguments plus the
+// LR captured at stub entry (the return address into the game's throw
+// helper, e.g. 0x99098877). That LR is ret0 below -- identical to what
+// the old C hook printed via __builtin_return_address(0). ret1..ret5
+// were always 0: this TU is built without frame pointers, so the old
+// builtin frame walk read 0 as well.
+void cxa_throw_log_from_hook(void *ex, void *tinfo, void (*dest)(void *),
+                             void *caller_lr) {
     static int log_count = 0;
+    (void)dest;
     if (log_count < 16) {
         const char *mangled = tinfo_mangled_name(tinfo);
         int corrupt = heap_has_0c0c0c0c();
@@ -1014,17 +1279,14 @@ void __cxa_throw_soloader(void *ex, void *tinfo, void (*dest)(void *)) {
         // bootlog names the exact get_child("<xmlattr>") site. The game is
         // built with frame pointers (push {r4,r6,r7,lr} / add r7,sp,#8).
         blog("THROW: backtrace ret0=%p ret1=%p ret2=%p ret3=%p ret4=%p ret5=%p",
-             __builtin_return_address(0), __builtin_return_address(1),
-             __builtin_return_address(2), __builtin_return_address(3),
-             __builtin_return_address(4), __builtin_return_address(5));
+             caller_lr, (void *)0, (void *)0, (void *)0, (void *)0, (void *)0);
         log_count++;
     }
-    if (g_real_cxa_throw)
-        g_real_cxa_throw(ex, tinfo, dest);
-    for (;;) { /* noreturn backstop */ }
 }
 
-void __cxa_rethrow_soloader(void) {
+// Called from the asm rethrow stub; matches the old C hook's logging
+// (single THROW line naming the in-flight exception type).
+void cxa_rethrow_log_from_hook(void) {
     static int log_count = 0;
     if (log_count < 16) {
         const char *mangled = "<rethrow>";
@@ -1037,9 +1299,6 @@ void __cxa_rethrow_soloader(void) {
         blog("THROW: %s heap-corrupt=%s", mangled, corrupt ? "yes" : "no");
         log_count++;
     }
-    if (g_real_cxa_rethrow)
-        g_real_cxa_rethrow();
-    for (;;) { /* noreturn backstop */ }
 }
 
 // ---------------------------------------------------------------------------
