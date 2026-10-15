@@ -17,6 +17,7 @@
 
 #include "utils/dialog.h"
 #include "so_util.h"
+#include "bootlog.h" /* blog(): unbuffered bootlog.txt writer (source/bootlog.c) */
 
 #ifndef SCE_KERNEL_MEMBLOCK_TYPE_USER_RX
 #define SCE_KERNEL_MEMBLOCK_TYPE_USER_RX                 (0x0C20D050)
@@ -130,8 +131,23 @@ int _so_load(so_module *mod, SceUID so_blockid, void *so_data, uintptr_t load_ad
 
     mod->shstr = (char *)((uintptr_t)so_data + mod->shdr[mod->ehdr->e_shstrndx].sh_offset);
 
+    /* Locate PT_ARM_EXIDX now: the PT_LOAD loop below mutates p_vaddr
+     * (applies the load bias), so capture the original file vaddr/size here
+     * and resolve the loaded address per containing segment below. */
+    Elf32_Addr exidx_vaddr = 0;
+    Elf32_Word exidx_memsz = 0;
+    for (int i = 0; i < mod->ehdr->e_phnum; i++) {
+        if (mod->phdr[i].p_type == PT_ARM_EXIDX) {
+            exidx_vaddr = mod->phdr[i].p_vaddr;
+            exidx_memsz = mod->phdr[i].p_memsz;
+            break;
+        }
+    }
+
     for (int i = 0; i < mod->ehdr->e_phnum; i++) {
         if (mod->phdr[i].p_type == PT_LOAD) {
+            Elf32_Addr seg_vaddr = mod->phdr[i].p_vaddr; /* original, pre-bias */
+            Elf32_Word seg_memsz = mod->phdr[i].p_memsz;
             void *prog_data;
             size_t prog_size;
 
@@ -208,6 +224,18 @@ int _so_load(so_module *mod, SceUID so_blockid, void *so_data, uintptr_t load_ad
             memset(zero, 0, prog_size - mod->phdr[i].p_filesz);
             kuKernelCpuUnrestrictedMemcpy(prog_data + mod->phdr[i].p_filesz, zero, prog_size - mod->phdr[i].p_filesz);
             free(zero);
+
+            /* If this segment contains the PT_ARM_EXIDX range, record its
+             * loaded address/size for __gnu_Unwind_Find_exidx. The bias is
+             * (biased p_vaddr - original p_vaddr) for this segment. */
+            if (exidx_memsz && exidx_vaddr >= seg_vaddr &&
+                exidx_vaddr + exidx_memsz <= seg_vaddr + seg_memsz) {
+                Elf32_Addr bias = mod->phdr[i].p_vaddr - seg_vaddr;
+                mod->exidx_base = (uintptr_t)(exidx_vaddr + bias);
+                mod->exidx_size = exidx_memsz;
+                sceClibPrintf("exidx: base=0x%08X size=0x%X\n",
+                              mod->exidx_base, mod->exidx_size);
+            }
 
             kuKernelCpuUnrestrictedMemcpy((void *)mod->phdr[i].p_vaddr, (void *)((uintptr_t)so_data + mod->phdr[i].p_offset), mod->phdr[i].p_filesz);
         }
@@ -458,7 +486,7 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
                         }
                     }
 
-                    for (int j = 0; j < size_default_dynlib / sizeof(so_default_dynlib); j++) {
+                    for (int j = 0; !resolved && j < size_default_dynlib / sizeof(so_default_dynlib); j++) {
                         if (strcmp(mod->dynstr + sym->st_name, default_dynlib[j].symbol) == 0) {
                             val = default_dynlib[j].func;
                             kuKernelCpuUnrestrictedMemcpy(ptr, &val, sizeof(uintptr_t));
@@ -523,10 +551,42 @@ int so_resolve_with_dummy(so_module *mod, so_default_dynlib *default_dynlib, int
     return 0;
 }
 
+void (*so_init_logger)(int idx, int total, uintptr_t addr) = NULL;
+
+/* Diagnostic init-skip list: indices into the module's init_array that are
+ * skipped (with a bootlog line). Used to isolate a crashing static
+ * initializer. Empty by default.
+ *
+ * Bug 37 (Build Z): index 82 sat in this list from an early startup-crash
+ * isolation and was never removed. Index 82 is libengine's GAME scene
+ * init (fn 0x858b0): skipping it left the GAME scene permanently
+ * unconstructed, so the shop's switch to "GAME" failed on every request
+ * while everything upstream worked. The skip predates many loader
+ * fixes; the list is empty again (-1 matches no index). */
+static const int so_init_skip[] = { -1 };
+static const int so_init_skip_count = sizeof(so_init_skip) / sizeof(so_init_skip[0]);
+
 void so_initialize(so_module *mod) {
+    /* Skips apply only to libengine.so; other modules' init_arrays are
+     * unaffected. The list is currently empty (see the Bug 37 note at
+     * the list definition). */
+    int do_skip = mod && mod->soname && strstr(mod->soname, "libengine.so") != NULL;
     for (int i = 0; i < mod->num_init_array; i++) {
-        if (mod->init_array[i] && (int)mod->init_array[i] != -1)
-            mod->init_array[i]();
+        if (mod->init_array[i] && (int)mod->init_array[i] != -1) {
+            int skip = 0;
+            if (do_skip) {
+                for (int s = 0; s < so_init_skip_count; s++)
+                    if (so_init_skip[s] == i) { skip = 1; break; }
+            }
+            if (so_init_logger)
+                so_init_logger(i, mod->num_init_array, (uintptr_t)mod->init_array[i]);
+            if (skip) {
+                if (so_init_logger)
+                    so_init_logger(-1000 - i, mod->num_init_array, (uintptr_t)mod->init_array[i]);
+            } else {
+                mod->init_array[i]();
+            }
+        }
     }
 }
 
@@ -642,6 +702,111 @@ uintptr_t so_symbol(so_module *mod, const char *symbol) {
         return (uintptr_t) NULL;
 
     return mod->text_base + mod->dynsym[index].st_value;
+}
+
+/* ---- ARM EHABI unwinder support ---------------------------------------
+ * The game's libc++_shared.so was built against libgcc's unwinder and
+ * imports __gnu_Unwind_Find_exidx (a GLOBAL JUMP_SLOT ref). Without it,
+ * the first C++ throw dies in the loader's FATAL unknown-symbol stub.
+ * Implemented here over the PT_ARM_EXIDX ranges recorded at load time,
+ * following libgcc's semantics:
+ *   _Unwind_Ptr __gnu_Unwind_Find_exidx(_Unwind_Ptr pc, int *pcount)
+ * Returns a pointer to the exidx entry (two words: prel31 function offset,
+ * prel31 unwind data) covering pc, or 0 if no loaded module covers it.
+ * *pcount is set to the number of table entries from the returned entry
+ * to the end of that module's table (0 when not found).
+ * ---------------------------------------------------------------------- */
+
+/* prel31: 31-bit signed offset from the address of the field itself
+ * (bit 31 of the field must be zero). */
+static int32_t prel31_offset(uint32_t w) {
+    return (int32_t)(w << 1) >> 1; /* drop bit 31, sign-extend bit 30 */
+}
+
+static uintptr_t prel31_decode(uintptr_t field) {
+    uint32_t w = *(volatile uint32_t *)field;
+    return field + (intptr_t)prel31_offset(w);
+}
+
+static uintptr_t find_exidx_impl(uintptr_t pc, int *pcount) {
+    pc &= ~(uintptr_t)1; /* exidx holds even addresses; drop any thumb bit */
+
+    so_module *mod = head;
+    while (mod) {
+        /* Bug 29: only the module whose text range actually contains pc
+         * may answer. Without this containment check, the FIRST module in
+         * the list (libc++_shared.so, text 0x98000000-0x980821a4) "matched"
+         * every libengine PC (0x99000000+): all of its exidx function
+         * addresses sort below any engine PC, so the binary search below
+         * happily returned libc++'s LAST exidx entry (pcount=1) for every
+         * engine frame. libunwind then adopted that foreign entry as the
+         * frame's unwind info, so libengine's own exidx/LSDA was never
+         * consulted and NO exception thrown inside libengine could ever
+         * find its handler — including fn 0x18a910's in-frame
+         * catch (boost::bad_lexical_cast) for the LOOP-token
+         * lexical_cast, which therefore terminated as "uncaught".
+         * (Throws fully inside libc++_shared were unaffected: it is both
+         * first in the list and the correct module for its own PCs, and
+         * loader/eboot PCs matched nothing before or after this fix.) */
+        if (mod->exidx_base && mod->exidx_size >= 8 &&
+            pc >= mod->text_base && pc < mod->text_base + mod->text_size) {
+            /* Entries are sorted by function address: binary search for the
+             * greatest function address <= pc. */
+            uint32_t n = (uint32_t)(mod->exidx_size / 8);
+            int32_t lo = 0, hi = (int32_t)n - 1, best = -1;
+            while (lo <= hi) {
+                int32_t mid = lo + ((hi - lo) >> 1);
+                uintptr_t fn = prel31_decode(mod->exidx_base + (uintptr_t)mid * 8);
+                if (fn <= pc) {
+                    best = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            if (best >= 0) {
+                if (pcount)
+                    *pcount = (int)(n - (uint32_t)best);
+                return mod->exidx_base + (uintptr_t)best * 8;
+            }
+            /* pc belongs to this module but precedes its first exidx
+             * entry: it has no unwind info here. Do not let a later
+             * module claim it. */
+            break;
+        }
+        mod = mod->next;
+    }
+
+    if (pcount)
+        *pcount = 0;
+    return 0;
+}
+
+/* Bug 29 EH-fix build 2026-10-13-B: public entry point = impl above plus a
+ * bounded trace. For the first 24 calls whose pc is in libengine range
+ * (>= 0x99000000), one line goes to bootlog.txt via blog() — the same
+ * unbuffered sceIoWrite channel the THROW/FAKE-DIAG lines use, so lines
+ * written mid-unwind are on disk before any abort can lose them (this
+ * function is called BY the unwinder while the throw is in flight).
+ * Lets the next bootlog prove which binary ran and what Find_exidx
+ * decided for each libengine frame of the fatal unwind.
+ *
+ * Build 2026-10-13-C (Addendum 2, R1-vs-R2): the B trace's >= 0x99000000
+ * gate cannot see frame 0 of the fatal unwind — pc inside __cxa_throw
+ * itself (0x9806b1d4, libc++_shared range) — and bootlog-4 showed ZERO
+ * gated lines, so we cannot tell whether the wrapper is ever entered at
+ * all. EXIDX2 below drops the gate: the first 32 calls of ANY pc are
+ * logged. If the PLT binding is live, the frame-0 call must appear as
+ * EXIDX2 pc=0x9806xxxx; no EXIDX2 lines at all would mean the PLT call
+ * never reaches this wrapper (R1, binding dead below the slot). The
+ * gated B trace is kept unchanged alongside it. */
+uintptr_t gnu_Unwind_Find_exidx_soloader(uintptr_t pc, int *pcount) {
+    /* Build M (cleanup, diagnostics off): the EXIDX/EXIDX2 bounded
+     * traces that used to wrap this call are removed. The wrapper is
+     * a pure passthrough — find_exidx_impl's containment behavior
+     * (the Bug 29 fix) is byte-for-byte unchanged. */
+    int local_count = 0;
+    return find_exidx_impl(pc, pcount ? pcount : &local_count);
 }
 
 void so_symbol_fix_ldmia(so_module *mod, const char *symbol) {

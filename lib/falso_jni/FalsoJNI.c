@@ -27,6 +27,7 @@
 #include "FalsoJNI_ImplBridge.h"
 #include "FalsoJNI_Logger.h"
 #include "converter.h"
+#include "bootlog.h"
 
 // Objects to be passed to client applications:
 JavaVM jvm;
@@ -234,7 +235,21 @@ jint EnsureLocalCapacity(JNIEnv* env, jint capacity) {
 
 jobject AllocObject(JNIEnv* env, jclass clazz) {
     fjni_logv_warn("[JNI] AllocObject(env, 0x%x): not implemented", (int)clazz);
-    return (jobject)0x42424242;
+    // Bug 24: the game misuses the returned jobject as a char* (fprintf %s),
+    // crashing on the 0x42424242 sentinel. Return a zeroed dummy buffer
+    // instead: as a string it reads as "" (safe), and DeleteGlobalRef can
+    // free() it safely.
+    void *dummy = calloc(1, 16);
+    return (jobject)dummy;
+}
+
+// Bug 26: several JNI stubs returned the 0x42424242 "not implemented"
+// sentinel, which the game then misused as a char* (GetObjectClass ->
+// GetMethodID -> blog("%s", clazz) -> strlen crash). Hand out a heap dummy
+// string instead: safe as %s, and DeleteGlobalRef can free() it.
+jobject falso_dummy_jobject(void) {
+    char *d = strdup("falso_jni_dummy");
+    return (jobject)d; /* NULL if strdup fails; never a bad pointer */
 }
 
 jobject NewObject(JNIEnv* env, jclass clazz, jmethodID methodID, ...) {
@@ -263,7 +278,9 @@ jclass GetObjectClass(JNIEnv* env, jobject obj) {
     fjni_logv_dbg("[JNI] GetObjectClass(0x%x)", (int)obj);
     // Due to the way we implement class methods, it's safe to not waste
     // resources on mapping objects to classess and return just a constant val.
-    return (jclass)0x42424242;
+    // Bug 26: the old 0x42424242 constant was misused as a char* by the game
+    // (via GetMethodID -> blog %s) -> strlen crash. Return a heap dummy.
+    return (jclass)falso_dummy_jobject();
 }
 
 jboolean IsInstanceOf(JNIEnv* env, jobject obj, jclass clazz) {
@@ -294,6 +311,8 @@ jmethodID GetMethodID(JNIEnv* env, jclass clazz, const char* _name, const char* 
         fjni_logv_dbg("[JNI] GetMethodID(env, 0x%x, \"%s\", \"%s\"): %i", (int)clazz, name, sig, (int)ret);
     } else {
         fjni_logv_err("[JNI] GetMethodID(env, 0x%x, \"%s\", \"%s\"): not found", (int)clazz, name, sig, (int)ret);
+        blog("JNI: GetMethodID(class=\"%s\", name=\"%s\", sig=\"%s\"): NOT FOUND",
+             clazz ? (const char *)clazz : "(null)", name, sig ? sig : "(null)");
     }
 
     return ret;
@@ -851,6 +870,11 @@ jmethodID GetStaticMethodID(JNIEnv* env, jclass clazz, const char* _name, const 
         fjni_logv_dbg("[JNI] GetStaticMethodID(env, 0x%x, \"%s\", \"%s\"): %i", (int)clazz, name, sig, (int)ret);
     } else {
         fjni_logv_err("[JNI] GetStaticMethodID(env, 0x%x, \"%s\", \"%s\"): not found", (int)clazz, name, sig, (int)ret);
+        // Surface JNI lookup misses in the bootlog (fjni goes to the debug
+        // console only). Include the class name: FindClass returns a strdup
+        // of it as the jclass token.
+        blog("JNI: GetStaticMethodID(class=\"%s\", name=\"%s\", sig=\"%s\"): NOT FOUND",
+             clazz ? (const char *)clazz : "(null)", name, sig ? sig : "(null)");
     }
 
     return ret;
@@ -1073,9 +1097,110 @@ void CallStaticVoidMethodA(JNIEnv* env, jclass clazz, jmethodID methodID, const 
     methodVoidCall(methodID, _AtoV(0, args));
 }
 
+/* Bug 33-R (bug33-analysis.md 38 item 2): static-field resolution
+ * tracer for the gamepad keycode/axis maps. onGamepadButton's only
+ * gate is its lazily built map: 14x GetStaticFieldID (JNIEnv slot
+ * 0x240) + GetStaticIntField (slot 0x258) through the helper at
+ * libengine 0x3d57b8, inserting (android keycode -> engine button
+ * code); a press whose keycode lookup yields 0 is skipped at the
+ * handler's cbz. Build Q's fingerprint — btn_calls fired, zero
+ * button records — has exactly one reading (every lookup returned
+ * 0), and the statics cannot say whether the map was never built,
+ * was keyed wrong (e.g. every GetStaticIntField falling through to
+ * the bridge's default value 1, collapsing all keys onto 1), or was
+ * reset. So: log the first resolution of each KEYCODE_* / AXIS_*
+ * name -> field ID -> int value, at the two JNI entry points the
+ * helper actually calls. fjni_logv_* reaches stdout only, so these
+ * lines go through blog() to land in bootlog.txt with everything
+ * else. First resolution per distinct name only; behavior of both
+ * entry points is otherwise unchanged. */
+#define KEYRES_MAX 24
+typedef struct {
+    char name[32];
+    int  id;        /* field ID served for the name; 0 = miss */
+    int  logged;    /* the KEYRES line for this name was emitted */
+} keyres_entry_t;
+static keyres_entry_t g_keyres[KEYRES_MAX];
+static int g_keyres_count = 0;
+static int g_keyres_unnamed_ids[KEYRES_MAX];
+static int g_keyres_unnamed_count = 0;
+
+static int keyres_is_tracked(const char* name) {
+    if (!name)
+        return 0;
+    return strncmp(name, "KEYCODE_", 8) == 0 || strncmp(name, "AXIS_", 5) == 0;
+}
+
+static keyres_entry_t* keyres_find_by_name(const char* name) {
+    for (int i = 0; i < g_keyres_count; i++) {
+        if (strcmp(g_keyres[i].name, name) == 0)
+            return &g_keyres[i];
+    }
+    return NULL;
+}
+
+static keyres_entry_t* keyres_find_by_id(int id) {
+    if (id == 0)
+        return NULL;
+    for (int i = 0; i < g_keyres_count; i++) {
+        if (g_keyres[i].id == id)
+            return &g_keyres[i];
+    }
+    return NULL;
+}
+
+static void keyres_note_id(const char* name, jfieldID id) {
+    if (!keyres_is_tracked(name))
+        return;
+    keyres_entry_t* e = keyres_find_by_name(name);
+    if (!e) {
+        if (g_keyres_count >= KEYRES_MAX)
+            return;
+        e = &g_keyres[g_keyres_count++];
+        strncpy(e->name, name, sizeof(e->name) - 1);
+        e->name[sizeof(e->name) - 1] = '\0';
+        e->id = 0;
+        e->logged = 0;
+    }
+    e->id = (int)id;
+    if (id == NULL && !e->logged) {
+        /* A miss can never be followed by a value read for this
+         * name (the map-build helper skips the insert), so the
+         * miss IS the complete resolution story for it. */
+        e->logged = 1;
+        blog("KEYRES: name=\"%s\" id=NULL value=(unresolved: resolution miss)", name);
+    }
+}
+
+static void keyres_note_value(jfieldID id, jint value) {
+    keyres_entry_t* e = keyres_find_by_id((int)id);
+    if (e) {
+        if (!e->logged) {
+            e->logged = 1;
+            blog("KEYRES: name=\"%s\" id=%d value=%d", e->name, (int)id, (int)value);
+        }
+        return;
+    }
+    /* A value served for a gamepad-map ID (the 400..420 block from
+     * jni_bridge.c) whose name resolution was never seen: name the
+     * divergence anyway, once per ID. */
+    int iv = (int)id;
+    if (iv >= 400 && iv <= 420) {
+        for (int i = 0; i < g_keyres_unnamed_count; i++) {
+            if (g_keyres_unnamed_ids[i] == iv)
+                return;
+        }
+        if (g_keyres_unnamed_count < KEYRES_MAX)
+            g_keyres_unnamed_ids[g_keyres_unnamed_count++] = iv;
+        blog("KEYRES: name=(unnamed) id=%d value=%d", iv, (int)value);
+    }
+}
+
 jfieldID GetStaticFieldID(JNIEnv* env, jclass clazz, const char* name, const char* t) {
     fjni_logv_dbg("[JNI] GetStaticFieldID(env, 0x%x, \"%s\", \"%s\")", (int)clazz, name, t);
-    return getFieldIdByName(name);
+    jfieldID id = getFieldIdByName(name);
+    keyres_note_id(name, id);
+    return id;
 }
 
 jobject GetStaticObjectField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
@@ -1105,7 +1230,9 @@ jshort GetStaticShortField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
 
 jint GetStaticIntField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
     fjni_logv_dbg("[JNI] GetStaticIntField(env, 0x%x, %i): ", (int)clazz, fieldID);
-    return getIntFieldValueById(fieldID);
+    jint value = getIntFieldValueById(fieldID);
+    keyres_note_value(fieldID, value);
+    return value;
 }
 
 jlong GetStaticLongField(JNIEnv* env, jclass clazz, jfieldID fieldID) {
