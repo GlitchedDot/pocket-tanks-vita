@@ -7,6 +7,7 @@ endif ()
 set(CMAKE_TOOLCHAIN_FILE "$ENV{VITASDK}/share/vita.toolchain.cmake" CACHE PATH "Toolchain file")
 
 project(pockettanks C CXX)
+enable_language(ASM)
 
 include("$ENV{VITASDK}/share/vita.cmake" REQUIRED)
 
@@ -39,6 +40,9 @@ add_executable(${PROJECT_NAME}
   source/bootlog.c
   source/egl_graphics.c
   source/jni_bridge.c
+  source/music.c
+  source/stb_vorbis_impl.c
+  source/fmod_trace.c
   source/fake_motionevent.c
   source/asset_mgr.c
   source/sound.c
@@ -46,6 +50,7 @@ add_executable(${PROJECT_NAME}
   source/dynlib.c
   source/android_log.c
   source/bionic_compat.c
+  source/cxa_throw_stub.s
   source/bionic_ctype.c
   source/bionic_pthread.c
   source/gl_wrappers.c
@@ -71,7 +76,10 @@ target_link_libraries(${PROJECT_NAME}
   SceAppMgr_stub
   SceAppUtil_stub
   SceAudio_stub
+  SceAudiodec_stub
   SceCommonDialog_stub
+  SceIme_stub
+  SceSysmodule_stub
   SceCtrl_stub
   SceDisplay_stub
   SceGxm_stub
