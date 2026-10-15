@@ -27,6 +27,13 @@
 
 #include <falso_jni/FalsoJNI.h> /* for &jni (fake JNIEnv*) in the key-0 fixup below */
 
+/* Engine-facing clock (bionic_compat.c; Bug 31): takes BIONIC clock ids
+ * (CLOCK_REALTIME=0, CLOCK_MONOTONIC=1) and serves the monotonic family
+ * from sceKernelGetProcessTimeWide() — the exact source the engine built
+ * its timedwait abstimes from. Used by bionic_pthread_cond_timedwait so
+ * the deadline comparison is like against like (Bug 36). */
+int clock_gettime_soloader(int clk_id, struct timespec *tp);
+
 /* Bionic (NDK r21, 32-bit ARM) layouts. Sizes must match; the .so allocates
  * these on its own stack/globals, we just read/write the slots. */
 typedef volatile int32_t b_mutex_t;          /* 4 bytes; 0 = statically init'd */
@@ -103,8 +110,6 @@ int bionic_pthread_mutex_destroy(void *m) {
     return 0;
 }
 int bionic_pthread_mutex_lock(void *m) {
-    int32_t v = __atomic_load_n((int32_t *)m, __ATOMIC_ACQUIRE);
-    blog("API: pthread_mutex_lock(m=%p, *m=%#x)", m, (unsigned)v);
     int id = mutex_ensure((b_mutex_t *)m, 0);
     if (!id)
         return EINVAL;
@@ -118,28 +123,47 @@ int bionic_pthread_mutex_trylock(void *m) {
 }
 int bionic_pthread_mutex_unlock(void *m) {
     int32_t v = __atomic_load_n((int32_t *)m, __ATOMIC_ACQUIRE);
-    blog("API: pthread_mutex_unlock(m=%p, *m=%#x)", m, (unsigned)v);
     if (v == 0)
         return EINVAL;
     return sceKernelUnlockMutex((SceUID)v, 1) < 0 ? EPERM : 0;
 }
 
 /* --- condition variables --- */
+/* Bug 36: errno values returned across the dynlib boundary must use
+ * BIONIC numbering, because the bionic-compiled engine compares against
+ * bionic constants. ETIMEDOUT is the one value in this file whose
+ * numbering diverges: VitaSDK/newlib says 116, bionic (and boost's
+ * hardcoded `cmp res, #110`) says 110. Returning 116 made boost's
+ * do_wait_until take its generic error path and throw condition_error —
+ * fatal at SHOP scene construction in build V. Every other code this
+ * file returns (EPERM 1, ENOMEM 12, EBUSY 16, EINVAL 22) numbers the
+ * same in both libcs. */
+#define BIONIC_ETIMEDOUT 110
+/* Bionic clock ids, as stored by bionic_pthread_condattr_setclock. */
+#define B_CLOCK_REALTIME  0
+#define B_CLOCK_MONOTONIC 1
+
 typedef struct {
     SceUID guard;   /* protects waiters */
     SceUID sema;    /* waiters block here */
     int    waiters;
+    int    clock_id; /* bionic clock the abstime is read against (Bug 36) */
 } bcond_internal_t;
 
 static int g_cond_seq = 0;
 
-static bcond_internal_t *cond_ensure(b_cond_t *c) {
+/* clock_id is recorded only when the internal object is first created
+ * (by bionic_pthread_cond_init, from the condattr); lazy materialization
+ * from wait/signal/broadcast passes B_CLOCK_REALTIME, the POSIX default
+ * for conds that never saw an init call. */
+static bcond_internal_t *cond_ensure(b_cond_t *c, int clock_id) {
     int32_t cur = __atomic_load_n((int32_t *)c, __ATOMIC_ACQUIRE);
     if (cur != 0)
         return (bcond_internal_t *)(uintptr_t)cur;
     bcond_internal_t *nc = calloc(1, sizeof(*nc));
     if (!nc)
         return NULL;
+    nc->clock_id = clock_id;
     char name[32];
     int seq = __atomic_fetch_add(&g_cond_seq, 1, __ATOMIC_RELAXED);
     sceClibSnprintf(name, sizeof(name), "bcg_%d", seq);
@@ -179,9 +203,13 @@ int bionic_pthread_condattr_setclock(void *attr, int clockid) {
 }
 
 int bionic_pthread_cond_init(void *c, const void *attr) {
-    (void)attr;
+    /* Bug 36: honor the condattr clock. The attr word already carries
+     * the bionic clock id stored by bionic_pthread_condattr_setclock
+     * (the engine sets CLOCK_MONOTONIC=1 on every boost/asio cond);
+     * NULL attr means the POSIX default, CLOCK_REALTIME. */
+    int clock_id = attr ? (int)*(const b_condattr_t *)attr : B_CLOCK_REALTIME;
     *(int32_t *)c = 0;
-    return cond_ensure((b_cond_t *)c) ? 0 : ENOMEM;
+    return cond_ensure((b_cond_t *)c, clock_id) ? 0 : ENOMEM;
 }
 int bionic_pthread_cond_destroy(void *c) {
     bcond_internal_t *ic = (bcond_internal_t *)(uintptr_t)
@@ -194,7 +222,7 @@ int bionic_pthread_cond_destroy(void *c) {
     return 0;
 }
 int bionic_pthread_cond_wait(void *c, void *m) {
-    bcond_internal_t *ic = cond_ensure((b_cond_t *)c);
+    bcond_internal_t *ic = cond_ensure((b_cond_t *)c, B_CLOCK_REALTIME);
     if (!ic)
         return EINVAL;
     sceKernelLockMutex(ic->guard, 1, NULL);
@@ -208,30 +236,50 @@ int bionic_pthread_cond_wait(void *c, void *m) {
     return bionic_pthread_mutex_lock(m);
 }
 int bionic_pthread_cond_timedwait(void *c, void *m, const struct timespec *abstime) {
-    bcond_internal_t *ic = cond_ensure((b_cond_t *)c);
+    bcond_internal_t *ic = cond_ensure((b_cond_t *)c, B_CLOCK_REALTIME);
     if (!ic)
         return EINVAL;
+    /* Bug 36: read "now" on the cond's own clock, through the
+     * engine-facing shim, so a MONOTONIC cond's abstime (built from
+     * sceKernelGetProcessTimeWide) is compared against the same source
+     * — the old code compared it against newlib CLOCK_REALTIME (~1.79e9),
+     * making every monotonic deadline read ~1.79 billion seconds past. */
     struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
+    clock_gettime_soloader(ic->clock_id, &now);
     int64_t target_us = (int64_t)abstime->tv_sec * 1000000LL + abstime->tv_nsec / 1000;
     int64_t now_us = (int64_t)now.tv_sec * 1000000LL + now.tv_nsec / 1000;
     int64_t delta_us = target_us - now_us;
-    if (delta_us <= 0)
-        return ETIMEDOUT;
-    sceKernelLockMutex(ic->guard, 1, NULL);
-    ic->waiters++;
-    sceKernelUnlockMutex(ic->guard, 1);
-    bionic_pthread_mutex_unlock(m);
-    SceUInt to = delta_us > 0xFFFFFFFE ? 0xFFFFFFFE : (SceUInt)delta_us;
-    int r = sceKernelWaitSema(ic->sema, 1, &to);
-    sceKernelLockMutex(ic->guard, 1, NULL);
-    ic->waiters--;
-    sceKernelUnlockMutex(ic->guard, 1);
-    bionic_pthread_mutex_lock(m);
-    return r < 0 ? ETIMEDOUT : 0;
+    int rc;
+    if (delta_us <= 0) {
+        rc = BIONIC_ETIMEDOUT;
+    } else {
+        sceKernelLockMutex(ic->guard, 1, NULL);
+        ic->waiters++;
+        sceKernelUnlockMutex(ic->guard, 1);
+        bionic_pthread_mutex_unlock(m);
+        SceUInt to = delta_us > 0xFFFFFFFE ? 0xFFFFFFFE : (SceUInt)delta_us;
+        int r = sceKernelWaitSema(ic->sema, 1, &to);
+        sceKernelLockMutex(ic->guard, 1, NULL);
+        ic->waiters--;
+        sceKernelUnlockMutex(ic->guard, 1);
+        bionic_pthread_mutex_lock(m);
+        rc = r < 0 ? BIONIC_ETIMEDOUT : 0;
+    }
+    /* Bug 36 diagnostics: first ~8 timedwaits, then silent — proves the
+     * new arithmetic (positive delta, genuine block, bionic-110 timeout)
+     * in the next bootlog. */
+    static int s_condwait_logged = 0;
+    if (__atomic_fetch_add(&s_condwait_logged, 1, __ATOMIC_RELAXED) < 8) {
+        blog("CONDWAIT: clock=%d abstime=%lld.%09ld now=%lld.%09ld delta_us=%lld rc=%d",
+             ic->clock_id,
+             (long long)abstime->tv_sec, (long)abstime->tv_nsec,
+             (long long)now.tv_sec, (long)now.tv_nsec,
+             (long long)delta_us, rc);
+    }
+    return rc;
 }
 int bionic_pthread_cond_signal(void *c) {
-    bcond_internal_t *ic = cond_ensure((b_cond_t *)c);
+    bcond_internal_t *ic = cond_ensure((b_cond_t *)c, B_CLOCK_REALTIME);
     if (!ic)
         return EINVAL;
     sceKernelLockMutex(ic->guard, 1, NULL);
@@ -241,7 +289,7 @@ int bionic_pthread_cond_signal(void *c) {
     return 0;
 }
 int bionic_pthread_cond_broadcast(void *c) {
-    bcond_internal_t *ic = cond_ensure((b_cond_t *)c);
+    bcond_internal_t *ic = cond_ensure((b_cond_t *)c, B_CLOCK_REALTIME);
     if (!ic)
         return EINVAL;
     sceKernelLockMutex(ic->guard, 1, NULL);
@@ -326,7 +374,6 @@ int bionic_pthread_key_create(int *key, void (*dtor)(void *)) {
     if (slot < 0)
         return ENOMEM;
     *key = slot;
-    blog("API: pthread_key_create -> key=%d", slot);
     return 0;
 }
 int bionic_pthread_key_delete(int key) {
@@ -349,7 +396,6 @@ int bionic_pthread_key_delete(int key) {
     return 0;
 }
 int bionic_pthread_setspecific(int key, const void *value) {
-    blog("API: pthread_setspecific(key=%d, value=%p)", key, value);
     /* Key-0 fixup: libengine.so has two thread-local singletons sharing
      * hardcoded pthread key 0 (never via pthread_key_create):
      *  - a simple getter that calloc(2049,1)s a thread struct, and
@@ -363,8 +409,6 @@ int bionic_pthread_setspecific(int key, const void *value) {
      * worker threads take this path.) */
     if (key == 0 && value && *(void *const *)value == NULL && jni != NULL) {
         *(void **)value = (void *)&jni;
-        blog("API: pthread_setspecific: key-0 cell %p seeded with JNIEnv* %p",
-             value, (void *)&jni);
     }
     SceUID tid = sceKernelGetThreadId();
     SceUID lk = key_lock_ensure();
@@ -385,6 +429,11 @@ int bionic_pthread_setspecific(int key, const void *value) {
     return e ? 0 : ENOMEM;
 }
 void *bionic_pthread_getspecific(int key) {
+    /* Build M (cleanup): the per-call API line and the Bug 32-I SPIN
+     * caller capture that used to live here are removed — this shim is
+     * called thousands of times per frame and its unbuffered file
+     * logging was the loader's biggest frame-rate cost. The TLS lookup
+     * itself is unchanged. */
     SceUID tid = sceKernelGetThreadId();
     SceUID lk = key_lock_ensure();
     void *ret = NULL;
@@ -393,7 +442,6 @@ void *bionic_pthread_getspecific(int key) {
         if (e->tid == tid && e->key == key) { ret = (void *)e->value; break; }
     }
     if (lk) sceKernelUnlockMutex(lk, 1);
-    blog("API: pthread_getspecific(key=%d) -> %p", key, ret);
     return ret;
 }
 
