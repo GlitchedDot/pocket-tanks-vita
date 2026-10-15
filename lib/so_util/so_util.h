@@ -44,6 +44,11 @@ typedef struct so_module {
     char *soname;
     char *shstr;
     char *dynstr;
+
+    /* ARM EHABI unwind index: loaded address + size of the PT_ARM_EXIDX
+     * segment, recorded at load time for __gnu_Unwind_Find_exidx. */
+    uintptr_t exidx_base;
+    size_t exidx_size;
 } so_module;
 
 typedef struct {
@@ -63,7 +68,17 @@ int so_resolve(so_module *mod, so_default_dynlib *default_dynlib, int size_defau
 int so_resolve_with_dummy(so_module *mod, so_default_dynlib *default_dynlib, int size_default_dynlib, int default_dynlib_only);
 void so_symbol_fix_ldmia(so_module *mod, const char *symbol);
 void so_initialize(so_module *mod);
+/* Optional per-initializer logger, set by the app (may be NULL). */
+extern void (*so_init_logger)(int idx, int total, uintptr_t addr);
 uintptr_t so_symbol(so_module *mod, const char *symbol);
+
+/* ARM EHABI unwinder helper (libgcc ABI):
+ *   _Unwind_Ptr __gnu_Unwind_Find_exidx(_Unwind_Ptr pc, int *pcount)
+ * Returns a pointer to the .ARM.exidx entry covering pc (or 0); *pcount is
+ * set to the number of table entries from the returned entry to the end of
+ * the module's table (0 when not found). Implemented over the exidx ranges
+ * recorded at load time. */
+uintptr_t gnu_Unwind_Find_exidx_soloader(uintptr_t pc, int *pcount);
 
 #define SO_CONTINUE(type, h, ...) ({ \
   kuKernelCpuUnrestrictedMemcpy((void *)h.addr, h.orig_instr, sizeof(h.orig_instr)); \
