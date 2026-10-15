@@ -27,6 +27,9 @@ SLresult slCreateEngine(SLObjectItf *pEngine, SLuint32 numOptions,
 extern const unsigned char SL_IID_ENGINE[16];
 extern const unsigned char SL_IID_PLAY[16];
 extern const unsigned char SL_IID_BUFFERQUEUE[16];
+extern const unsigned char SL_IID_ANDROIDSIMPLEBUFFERQUEUE[16];
+extern const unsigned char SL_IID_ANDROIDCONFIGURATION[16];
+extern const unsigned char SL_IID_RECORD[16];
 extern const unsigned char SL_IID_VOLUME[16];
 
 #endif

@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h> // Bug 30: declares newlib memalign, bound directly below
 #include <string.h>
 #include <strings.h>
 #include <math.h>
@@ -45,6 +46,7 @@ int __open_2(const char*,int);
 int access_soloader(const char*,int);
 time_t time_soloader(time_t*);
 int gettimeofday_soloader(struct timeval*,void*);
+int clock_gettime_soloader(int,struct timespec*); // Bug 31: non-stalling MONOTONIC for the engine
 struct tm *gmtime_r_soloader(const time_t*,struct tm*);
 struct tm *localtime_r_soloader(const time_t*,struct tm*);
 struct tm *gmtime_soloader(const time_t*);
@@ -101,6 +103,7 @@ int __cxa_guard_acquire_soloader(uint64_t*);
 void __cxa_guard_release_soloader(uint64_t*);
 void __cxa_guard_abort_soloader(uint64_t*);
 void *dlsym_soloader(void*,const char*);
+void *dlopen_soloader(const char*,int);
 void *mmap64_soloader(void*,size_t,int,int,int,long long);
 int ret0(void); int ret1(void); int ret_neg1(void); void ret_void(void);
 void *__memclr_wrapper(void *s, size_t n);
@@ -109,15 +112,22 @@ int fputc_soloader(int c, FILE *stream);
 int fputs_soloader(const char *s, FILE *stream);
 int fprintf_soloader(FILE *stream, const char *format, ...);
 int vfprintf_soloader(FILE *stream, const char *format, va_list ap);
+int printf_soloader(const char *format, ...);
 int fflush_soloader(FILE *stream);
 #include <zlib.h>
 gzFile gzopen_soloader(const char *path, const char *mode);
 int gzwrite_soloader(gzFile file, const void *buf, unsigned len);
 int gzclose_soloader(gzFile file);
 ssize_t write_soloader(int fd, const void *buf, size_t nbyte);
+ssize_t read_soloader(int fd, void *buf, size_t nbyte);
+int close_soloader(int fd);
 FILE *fdopen_soloader(int fd, const char *mode);
 int fileno_soloader(FILE *stream);
-void *memalign_soloader(size_t a, size_t n);
+// Bug 30: NO memalign_soloader prototype here anymore. The "memalign"
+// table entry binds DIRECTLY to newlib's memalign (<malloc.h> above):
+// memalign_soloader stored the raw malloc pointer at aligned-4, which
+// plain free() misreads as a dlmalloc chunk size -- that is what killed
+// __cxa_free_exception on the first caught exception. Do not rebind.
 void exit_soloader(int status);
 void abort_soloader(void);
 void *memmem_soloader(const void *h, size_t hl, const void *n, size_t nl);
@@ -242,8 +252,8 @@ so_default_dynlib default_dynlib[] = {
     { "ceilf", (uintptr_t)&ceilf },
     { "clearerr", (uintptr_t)&clearerr },
     { "clock", (uintptr_t)&clock },
-    { "clock_gettime", (uintptr_t)&clock_gettime },
-    { "close", (uintptr_t)&close },
+    { "clock_gettime", (uintptr_t)&clock_gettime_soloader }, // Bug 31: was newlib &clock_gettime; its MONOTONIC path stalled the engine's frame delta (bionic_compat.c)
+    { "close", (uintptr_t)&close_soloader }, // Bug 35: was newlib &close; must free /dev/urandom virtual fds (bionic_compat.c)
     { "closedir", (uintptr_t)&closedir },
     { "connect", (uintptr_t)&ret_neg1 },
     { "cos", (uintptr_t)&cos },
@@ -262,7 +272,7 @@ so_default_dynlib default_dynlib[] = {
     { "dladdr", (uintptr_t)&ret0 },
     { "dlclose", (uintptr_t)&ret0 },
     { "dlerror", (uintptr_t)&ret0 },
-    { "dlopen", (uintptr_t)&ret1 },
+    { "dlopen", (uintptr_t)&dlopen_soloader },
     { "dlsym", (uintptr_t)&dlsym_soloader },
     { "eglGetCurrentSurface", (uintptr_t)&pt_eglGetCurrentSurface },
     { "eglGetDisplay", (uintptr_t)&eglGetDisplay },
@@ -422,7 +432,7 @@ so_default_dynlib default_dynlib[] = {
     { "lseek64", (uintptr_t)&lseek },
     { "malloc", (uintptr_t)&malloc_soloader },
     { "mbrlen", (uintptr_t)&mbrlen },
-    { "memalign", (uintptr_t)&memalign_soloader },
+    { "memalign", (uintptr_t)&memalign }, // Bug 30: newlib memalign -- free()-able chunks (bionic invariant)
     { "memchr", (uintptr_t)&memchr },
     { "memcmp", (uintptr_t)&memcmp },
     { "memcpy", (uintptr_t)&memcpy },
@@ -446,7 +456,7 @@ so_default_dynlib default_dynlib[] = {
     { "popen", (uintptr_t)&ret0 },
     { "pow", (uintptr_t)&pow },
     { "powf", (uintptr_t)&powf },
-    { "printf", (uintptr_t)&printf },
+    { "printf", (uintptr_t)&printf_soloader },
     { "pthread_attr_destroy", (uintptr_t)&pthread_attr_destroy },
     { "pthread_attr_getdetachstate", (uintptr_t)&pthread_attr_getdetachstate },
     { "pthread_attr_init", (uintptr_t)&pthread_attr_init },
@@ -486,7 +496,7 @@ so_default_dynlib default_dynlib[] = {
     { "qsort", (uintptr_t)&qsort },
     { "raise", (uintptr_t)&raise },
     { "rand", (uintptr_t)&rand },
-    { "read", (uintptr_t)&read },
+    { "read", (uintptr_t)&read_soloader }, // Bug 35: was newlib &read; must serve /dev/urandom virtual fds (bionic_compat.c)
     { "readdir", (uintptr_t)&readdir },
     { "realloc", (uintptr_t)&realloc },
     { "recv", (uintptr_t)&ret_neg1 },
